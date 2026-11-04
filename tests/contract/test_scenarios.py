@@ -447,8 +447,20 @@ def test_every_blocklisted_preference_key_actually_exists(seeder: Client) -> Non
     # by loosening the assertion for everything.
     write_only = {"web_ui_password"}
 
+    # Keys qBittorrent grew later. Blocking one on a server that has never heard
+    # of it guards nothing, but there is nothing to guard there either. Gating on
+    # the measured version keeps the typo check strict everywhere the key exists,
+    # rather than loosening the assertion for every key to accommodate one.
+    # Measured: absent on WebAPI 2.9.3 (qBittorrent 4.6.7), present on 2.11.2
+    # (5.0.2) and later.
+    introduced_in = {"python_executable_path": (2, 11, 2)}
+
     prefs = seeder.call("app/preferences")
-    phantom = sorted(k for k in LOCKOUT_KEYS - write_only if k not in prefs)
+    phantom = sorted(
+        k
+        for k in LOCKOUT_KEYS - write_only
+        if k not in prefs and seeder.version >= introduced_in.get(k, (0, 0, 0))
+    )
     assert not phantom, (
         f"blocklisted keys that this server does not expose, so they guard "
         f"nothing: {phantom}. Check the spelling against app/preferences."
