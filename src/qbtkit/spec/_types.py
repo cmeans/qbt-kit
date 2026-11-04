@@ -127,6 +127,13 @@ class Param:
     # Refuse these values outright, whatever the caller asks. Used for the
     # setPreferences keys that would sever the connection.
     blocklist: frozenset[str] = field(default_factory=frozenset)
+    # Keys an agent may write. Anything outside is refused on the agent path and
+    # passes with a warning on the CLI. An allowlist rather than a longer
+    # blocklist because a blocklist has to anticipate every dangerous key, and
+    # the two reports that prompted this found three it had not.
+    allowlist: frozenset[str] = field(default_factory=frozenset)
+    # Refused whenever this param is present on the agent path, at any value.
+    agent_forbidden: bool = False
 
     def available_on(self, version: Version) -> bool:
         if self.since and version < self.since:
@@ -153,6 +160,11 @@ class Endpoint:
     # that gating only the curated tools left the raw escape hatch wide open.
     mutating: bool = False
     destructive: bool = False
+    # Never callable by a model, with no confirmation that permits it. For
+    # endpoints whose whole output is a credential, or whose effect is code
+    # execution on the qBittorrent host. See errors.AgentForbidden for why
+    # `confirm` is not the right gate for these.
+    agent_forbidden: bool = False
     # Endpoints that cannot be contract-tested, with the reason, so the coverage
     # ledger can distinguish "untested" from "deliberately untestable".
     untestable: str | None = None

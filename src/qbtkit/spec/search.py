@@ -113,6 +113,10 @@ register(
         body=Body.URLENCODED,
         params=(Param("sources", Wire.PIPE_LIST, required=True),),
         mutating=True,
+        # Reported externally against 0.1.2: a plugin was fetched from a URL and
+        # its Python ran inside qBittorrent's process. The prose warning above is
+        # advice to a human reading the summary; it was never a gate.
+        agent_forbidden=True,
         untestable="would fetch and execute third-party code",
     ),
     Endpoint(
@@ -146,6 +150,9 @@ register(
         summary="Update all installed plugins from their source URLs.",
         returns=NoContent,
         mutating=True,
+        # Same outcome as installPlugin without naming a source: it re-fetches
+        # and re-executes from whatever URLs the installed plugins carry.
+        agent_forbidden=True,
         untestable="would fetch third-party code",
     ),
 )

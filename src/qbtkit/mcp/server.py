@@ -136,6 +136,20 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
                 },
                 indent=2,
             )
+        except errors.AgentForbidden as e:
+            # Worth a distinct refusal rather than folding into the one above:
+            # told "blocked", a model reasonably tries confirm=true next. This
+            # says the override does not exist and names who can do it instead.
+            return json.dumps(
+                {
+                    "refused": "agent_forbidden",
+                    "detail": str(e),
+                    "remedy": "no confirmation permits this through MCP, because "
+                    "a model sets confirm itself. Ask the user to do it in "
+                    "qBittorrent or with the `qbt` CLI.",
+                },
+                indent=2,
+            )
         except errors.UnsupportedEndpoint as e:
             return json.dumps(
                 {
@@ -182,6 +196,9 @@ def _client() -> Client:
         password=_OPTS["password"],
         api_key=_OPTS["api_key"],
         read_only=_OPTS["read_only"],
+        # Every client this process builds is driven by a model, so the stricter
+        # gates apply to all of them — including the ones `qbt_call` uses.
+        agent=True,
     )
 
 
@@ -648,7 +665,13 @@ def list_endpoints(
                 "summary": e.summary,
                 "mutating": e.mutating,
                 "destructive": e.destructive,
+                # Advertised so a model can see a wall before walking into it,
+                # rather than discovering it as a refusal.
+                "agent_forbidden": e.agent_forbidden,
                 "params": [p.name for p in e.params],
+                "agent_forbidden_params": [
+                    p.name for p in e.params if p.agent_forbidden
+                ],
                 "since": ".".join(map(str, e.since)) if e.since else None,
             }
         )

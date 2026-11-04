@@ -426,6 +426,14 @@ register(
             integer("inactiveSeedingTimeLimit", since=(2, 9, 2)),
         ),
         mutating=True,
+        # A limit is only half of a share rule; the other half is the global
+        # `max_ratio_act`, and at 1 or 3 qBittorrent removes the torrent and
+        # deletes its files when the limit is reached. So reaching a limit here
+        # can destroy data without this call naming deletion anywhere, which is
+        # why `torrents/delete` requiring confirm while this did not was
+        # inconsistent. The global keys are off SAFE_PREF_KEYS for the same
+        # reason, and both halves are now gated.
+        destructive=True,
     ),
     # ----- toggles
     Endpoint(
@@ -712,6 +720,9 @@ register(
         summary="Per-torrent SSL certificate, key and DH params.",
         returns=Json("SSLParameters"),
         params=(text("hash", required=True),),
+        # The reply contains a private key. Forbidding is simpler and safer than
+        # redacting a field whose whole purpose is to be secret.
+        agent_forbidden=True,
     ),
     Endpoint(
         scope="torrents",

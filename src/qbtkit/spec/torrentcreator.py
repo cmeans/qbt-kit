@@ -32,9 +32,15 @@ register(
         body=Body.URLENCODED,
         params=(
             text("sourcePath", required=True),
-            text("torrentFilePath", summary="where to write the .torrent"),
+            # Reported externally against 0.1.2: this overwrote an existing file
+            # of the reporter's choosing. qBittorrent writes wherever it can.
+            text("torrentFilePath", summary="where to write the .torrent",
+                 agent_forbidden=True),
             flag("private"),
-            flag("startSeeding"),
+            # Also reported: qBittorrent's own configuration directory was made
+            # into a torrent and announced. Creating one is recoverable;
+            # publishing it to a swarm is not.
+            flag("startSeeding", agent_forbidden=True),
             flag("optimizeAlignment"),
             integer("pieceSize", summary="0 lets qBittorrent choose"),
             integer("paddedFileSizeLimit"),
@@ -45,6 +51,9 @@ register(
             text("format", summary="v1, v2 or hybrid"),
         ),
         mutating=True,
+        # Reads any path the server can reach and writes a file; both halves were
+        # reported as abusable against 0.1.2.
+        destructive=True,
     ),
     Endpoint(
         scope="torrentcreator",

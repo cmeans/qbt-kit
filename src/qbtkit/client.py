@@ -11,6 +11,7 @@ import json as jsonlib
 import logging
 import os
 import subprocess
+import warnings
 from typing import Any
 
 import httpx
@@ -151,6 +152,7 @@ class Client:
         password: str | None = None,
         api_key: str | None = None,
         read_only: bool = False,
+        agent: bool = False,
         timeout: float = 30.0,
         keychain_service: str = "qbittorrent",
         use_keychain: bool = True,
@@ -158,6 +160,12 @@ class Client:
         self.url = (url or os.environ.get("QBT_URL") or "http://127.0.0.1:8080").rstrip("/")
         self.base = f"{self.url}/api/v2"
         self.read_only = read_only
+        # Set only by the MCP server. It belongs here rather than in the tool
+        # layer because `qbt_call` reaches every endpoint in the spec: a gate
+        # above the client is a gate the escape hatch walks around. Deliberately
+        # not readable from the environment — a prompt that can reach os.environ
+        # should not be able to turn this off.
+        self.agent = agent
         self._username = username or os.environ.get("QBT_USERNAME")
 
         # `use_keychain=False` is how a caller says "these credentials and no
@@ -287,18 +295,37 @@ class Client:
         return self.call_endpoint(ep, confirm=confirm, **params)
 
     def call_endpoint(self, ep: Endpoint, *, confirm: bool = False, **params: Any) -> Any:
+        """Gates, in order, all before any request so a refusal never depends on
+        reaching the server.
+
+        1. read-only      — anything mutating.
+        2. agent-forbidden endpoint, then param.
+        3. blocklist      — keys refused on every path, with no override.
+        4. allowlist      — on the agent path only; a warning on the CLI.
+        5. confirm        — destructive endpoints.
+
+        The no-override refusals come before `confirm` on purpose. Ordered the
+        other way, a model is told "pass confirm=True", passes it, and only then
+        learns there was never an override — two turns to reach the same wall,
+        and a transcript that reads like the gate was negotiable.
+        """
         if self.read_only and ep.mutating:
             raise errors.ReadOnly(f"{ep.path} mutates state; client is read-only")
-        if ep.destructive and not confirm:
-            raise errors.ConfirmationRequired(
-                f"{ep.path} is destructive; pass confirm=True to proceed"
+
+        if self.agent and ep.agent_forbidden:
+            raise errors.AgentForbidden(
+                f"{ep.path} is not available to a language model. Ask the user to "
+                f"do it in qBittorrent or with the `qbt` CLI."
             )
 
-        # Blocked values are refused before anything touches the network, and
-        # before the version probe, so the refusal does not depend on being able
-        # to reach the server.
         for p in ep.params:
-            if not p.blocklist or p.name not in params:
+            if self.agent and p.agent_forbidden and p.name in params:
+                raise errors.AgentForbidden(
+                    f"{ep.path}: {p.name} is not available to a language model. "
+                    f"Ask the user to do it in qBittorrent or with the `qbt` CLI."
+                )
+
+            if not (p.blocklist or p.allowlist) or p.name not in params:
                 continue
             # Parse first: the CLI sends this as JSON text, and a gate that
             # only understands dicts matched nothing and let the value through.
@@ -309,13 +336,38 @@ class Client:
                     f"checked against the blocklist; got {type(value).__name__}"
                 )
             params[p.name] = value
+
             offending = sorted(set(value) & p.blocklist)
             if offending:
                 raise errors.BlockedParameter(
                     f"{ep.path}: refusing to set {', '.join(offending)} — these "
-                    f"would sever this client's own connection or weaken the "
-                    f"server's security. Change them in qBittorrent directly."
+                    f"would sever this client's own connection, hand over code "
+                    f"execution, or weaken the server's security. Change them in "
+                    f"qBittorrent directly."
                 )
+
+            if p.allowlist:
+                unlisted = sorted(set(value) - p.allowlist)
+                if unlisted and self.agent:
+                    raise errors.AgentForbidden(
+                        f"{ep.path}: {', '.join(unlisted)} is not on the agent "
+                        f"allowlist. These keys can delete data, send it "
+                        f"elsewhere, or name a program to run, so a model may not "
+                        f"write them — there is no confirmation that permits it. "
+                        f"Ask the user to change them in qBittorrent, or use the "
+                        f"`qbt` CLI."
+                    )
+                if unlisted:
+                    warnings.warn(
+                        f"{ep.path}: {', '.join(unlisted)} is outside the reviewed-safe "
+                        f"set; check what it does before relying on this.",
+                        stacklevel=2,
+                    )
+
+        if ep.destructive and not confirm:
+            raise errors.ConfirmationRequired(
+                f"{ep.path} is destructive; pass confirm=True to proceed"
+            )
 
         version = self.version
         # A rename is not an absence. `since` on a renamed endpoint records when
