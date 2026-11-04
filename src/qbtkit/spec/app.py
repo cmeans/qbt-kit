@@ -124,7 +124,6 @@ SAFE_PREF_KEYS = frozenset(
         "torrent_changed_tmm_enabled",
         "save_path_changed_tmm_enabled",
         "category_changed_tmm_enabled",
-        "use_subcategories",
         "torrent_content_layout",
         "add_stopped_enabled",
         "start_paused_enabled",
@@ -132,7 +131,6 @@ SAFE_PREF_KEYS = frozenset(
         "incomplete_files_ext",
         "auto_delete_mode",
         "recheck_completed_torrents",
-        "export_torrent_dir_disabled",
         # Connectivity that is not the WebUI.
         "listen_port",
         "random_port",
