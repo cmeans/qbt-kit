@@ -34,8 +34,9 @@ register(
             text("sourcePath", required=True),
             # Reported externally against 0.1.2: this overwrote an existing file
             # of the reporter's choosing. qBittorrent writes wherever it can.
-            text("torrentFilePath", summary="where to write the .torrent",
-                 agent_forbidden=True),
+            text(
+                "torrentFilePath", summary="where to write the .torrent", agent_forbidden=True
+            ),
             flag("private"),
             # Also reported: qBittorrent's own configuration directory was made
             # into a torrent and announced. Creating one is recoverable;

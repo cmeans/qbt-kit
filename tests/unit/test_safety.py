@@ -260,7 +260,7 @@ def test_python_executable_path_is_refused_on_every_path() -> None:
     blocked; this was the route left open."""
     for c in (_agent(), _client()):
         with pytest.raises(errors.BlockedParameter):
-            c.call("app/setPreferences", json={"python_executable_path": "/tmp/x.sh"})
+            c.call("app/setPreferences", json={"python_executable_path": "/opt/evil/x.sh"})
 
 
 def test_agent_cannot_write_the_share_limit_action() -> None:
@@ -287,11 +287,11 @@ def test_agent_cannot_write_exfiltration_preferences() -> None:
     for key, value in (
         ("proxy_ip", "10.0.0.1"),
         ("proxy_type", 3),
-        ("export_dir", "/tmp/exfil"),
-        ("scan_dirs", {"/tmp/drop": 0}),
+        ("export_dir", "/opt/evil/exfil"),
+        ("scan_dirs", {"/opt/evil/drop": 0}),
         ("add_trackers", "http://evil.invalid/announce"),
         ("mail_notification_sender", "x@evil.invalid"),
-        ("file_log_path", "/tmp/log"),
+        ("file_log_path", "/opt/evil/log"),
         ("announce_ip", "10.0.0.1"),
     ):
         with pytest.raises(errors.AgentForbidden):
