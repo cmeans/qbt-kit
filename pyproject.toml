@@ -1,6 +1,6 @@
 [project]
 name = "qbt-kit"
-version = "0.1.2"
+version = "0.1.3"
 description = "Spec-driven client, 1:1 CLI and MCP server for the qBittorrent WebUI API"
 readme = "README.md"
 requires-python = ">=3.11"
