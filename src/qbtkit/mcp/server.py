@@ -6,8 +6,9 @@ the surface is 13 tools written for what someone actually wants to do, plus
 `qbt_call` as the escape hatch that keeps every endpoint reachable.
 
 The safety gates live in `Client`, not here, so `qbt_call` cannot bypass them —
-destructive endpoints need `confirm`, `--read-only` refuses anything mutating,
-and the `app/setPreferences` lockout keys are refused outright.
+destructive endpoints need `confirm`, as does `all` in a list of hashes,
+`--read-only` refuses anything mutating, and the `app/setPreferences` lockout keys
+are refused outright.
 """
 
 from __future__ import annotations
@@ -80,6 +81,17 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
     def _dispatch(*args: Any, **kwargs: Any) -> str:
         try:
             return fn(*args, **kwargs)
+        except errors.EveryTorrentNeedsConfirm as e:
+            return json.dumps(
+                {
+                    "refused": "every_torrent_needs_confirm",
+                    "detail": str(e),
+                    "remedy": "name the torrents by hash; list_torrents finds them. If "
+                    "every torrent really is what was asked for, ask the user, then "
+                    "re-send with confirm=true",
+                },
+                indent=2,
+            )
         except errors.ConfirmationRequired as e:
             return json.dumps(
                 {
@@ -98,6 +110,16 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
                     "remedy": "name the torrents by hash; list_torrents finds them. "
                     'Only if every torrent was asked for, pass hashes=["all"] on '
                     "its own with confirm=true",
+                },
+                indent=2,
+            )
+        except errors.MissingTags as e:
+            return json.dumps(
+                {
+                    "refused": "tags_required",
+                    "detail": str(e),
+                    "remedy": "name the tags; a blank or missing name means every tag "
+                    "on the torrent",
                 },
                 indent=2,
             )
@@ -239,15 +261,18 @@ def _forbid_unknown_arguments(name: str) -> None:
     The SDK ignores arguments a tool doesn't declare, so `hash=[one]` for
     `hashes` used to reach the tool as no hashes at all, and `delete_file=True`
     as keeping the files. It has no option for this, so the argument model is
-    tightened after registration; a unit test checks every tool, so an SDK change
-    that undoes this fails the suite rather than quietly reverting it.
+    tightened after registration. That relies on private SDK attributes: a unit test
+    checks every tool, so an SDK change that undoes this fails the suite, and
+    pyproject.toml caps the major version so users don't get one the suite hasn't
+    seen. The value is left out of the error because this reply isn't scrubbed.
     """
     tool = server._tool_manager.get_tool(name)
     if tool is None:
         raise RuntimeError(f"tool {name!r} wasn't registered under its function name")
 
-    strict = {"model_config": ConfigDict(extra="forbid")}
-    tool.fn_metadata.arg_model = type("Strict", (tool.fn_metadata.arg_model,), strict)
+    strict = {"model_config": ConfigDict(extra="forbid", hide_input_in_errors=True)}
+    base = tool.fn_metadata.arg_model
+    tool.fn_metadata.arg_model = type(f"{name} arguments", (base,), strict)
     tool.parameters["additionalProperties"] = False
 
 
@@ -268,6 +293,9 @@ def _brief(t: dict, fields: tuple[str, ...] = BRIEF) -> dict:
     return {k: t[k] for k in fields if k in t}
 
 
+_MAX_FILTER = 500
+
+
 def _find_targets(
     c: Client, path: str, hashes: list[str] | None, *, confirm: bool = False, **params: Any
 ) -> tuple[int | str, list[str]]:
@@ -282,10 +310,14 @@ def _find_targets(
     # Match the rows ourselves. 4.4.5 answers a filter holding only hashes it can't
     # parse with the whole library, which would count every torrent as found;
     # 4.5.5 and later answer it with nothing. A v2 torrent's
-    # `hash` is its truncated id, so the full hashes have to match too.
+    # `hash` is its truncated id, so the full hashes have to match too. This is a
+    # GET, so past a certain length the filter wouldn't fit in the URL.
     fields = ("hash", "infohash_v1", "infohash_v2")
     wanted = {h.lower() for h in hashes or []}
-    rows = c.call("torrents/info", hashes=hashes)
+    if len(wanted) <= _MAX_FILTER:
+        rows = c.call("torrents/info", hashes=hashes)
+    else:
+        rows = c.call("torrents/info")
     ids = [{str(t[key]).lower() for key in fields if t.get(key)} for t in rows]
     matched = [row for row in ids if row & wanted]
     if not matched:
@@ -577,18 +609,36 @@ def delete_torrents(
     )
 )
 def move_torrents(
-    hashes: Annotated[list[str], Field(description="torrent hashes")],
+    hashes: Annotated[
+        list[str],
+        Field(
+            description=(
+                'torrent hashes. The single value "all" targets EVERY torrent and '
+                "needs confirm=true"
+            )
+        ),
+    ],
     location: Annotated[str, Field(description="destination directory")],
     recheck: Annotated[
         bool, Field(description="verify against piece hashes afterwards; slow on large data")
     ] = False,
+    confirm: Annotated[bool, Field(description='must be true for "all"')] = False,
 ) -> str:
     with _client() as c:
-        c.call("torrents/setLocation", hashes=hashes, location=location)
+        moved, missing = _find_targets(
+            c, "torrents/setLocation", hashes, confirm=confirm, location=location
+        )
+        c.call("torrents/setLocation", hashes=hashes, location=location, confirm=confirm)
         if recheck:
-            c.call("torrents/recheck", hashes=hashes)
+            c.call("torrents/recheck", hashes=hashes, confirm=confirm)
     return json.dumps(
-        {"ok": True, "moved": len(hashes), "location": location, "rechecking": recheck},
+        {
+            "ok": True,
+            "moved": moved,
+            "not_found": missing,
+            "location": location,
+            "rechecking": recheck,
+        },
         indent=2,
     )
 
@@ -597,7 +647,10 @@ def move_torrents(
 def categories(
     action: Annotated[str, Field(description="list, create, edit or remove")] = "list",
     name: Annotated[str | None, Field(description="category name")] = None,
-    save_path: Annotated[str | None, Field(description="save path for it")] = None,
+    save_path: Annotated[
+        str | None,
+        Field(description='save path for it. Required for edit, where "" clears it'),
+    ] = None,
     confirm: Annotated[bool, Field(description="required for remove")] = False,
 ) -> str:
     with _client() as c:
@@ -734,13 +787,16 @@ def search(
         "Call any qBittorrent endpoint directly as scope/name, for anything the "
         "tools above do not cover. Parameters are validated against the endpoint "
         "spec, and the same safety gates apply: destructive endpoints need confirm, "
-        "and read-only mode refuses anything that mutates state."
+        'as does "all" in a list of hashes, and read-only mode refuses anything that '
+        "mutates state."
     )
 )
 def qbt_call(
     path: Annotated[str, Field(description="scope/name, e.g. torrents/pieceStates")],
     params: Annotated[dict[str, Any] | None, Field(description="endpoint parameters")] = None,
-    confirm: Annotated[bool, Field(description="required for destructive endpoints")] = False,
+    confirm: Annotated[
+        bool, Field(description='required for destructive endpoints and for "all"')
+    ] = False,
 ) -> str:
     with _client() as c:
         result = c.call(path, confirm=confirm, **(params or {}))

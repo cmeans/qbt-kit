@@ -11,8 +11,12 @@ Notable changes to qbt-kit. Format follows
 - **MCP tools now have to name the torrents they act on.** `control_torrents`
   and `tags` add/remove used to treat omitted hashes as every torrent, with no
   confirmation. They now refuse with `hashes_required`. Every torrent takes
-  `hashes=["all"]` and `confirm=true`, and the same gate covers `qbt_call`. The
-  CLI still accepts `all`.
+  `hashes=["all"]` and `confirm=true`, also for `move_torrents`, which gains
+  `confirm`, and for hash lists through `qbt_call`. The refusal is
+  `every_torrent_needs_confirm`. The CLI still accepts `all`.
+- `tags` add/remove refuses a blank name, and `qbt_call` refuses leaving `tags`
+  out of those calls, with `tags_required`. qBittorrent reads either as every tag
+  on the torrent.
 - **Unknown MCP tool arguments are errors.** A mistyped `hash` used to be dropped,
   which turned a call for one torrent into a call for all of them, and
   `delete_file=true` kept the files. Tool schemas now set
@@ -23,13 +27,20 @@ Notable changes to qbt-kit. Format follows
 
 ### Fixed
 
-- `control_torrents`, `tags` and `delete_torrents` report what the server has
-  rather than repeating the request. `applied_to` and `removed` are counts of
-  torrents found, or `"all"`, with the rest in `not_found`. If none exist, the call
-  is refused with `unknown_torrents` and nothing is sent. Deleting an unknown hash
+- `control_torrents`, `tags`, `move_torrents` and `delete_torrents` report what
+  the server has rather than repeating the request. `applied_to`, `moved` and
+  `removed` are counts of torrents found, or `"all"`, with the rest in
+  `not_found`. If none exist, the call is refused with `unknown_torrents` and
+  nothing is sent. Deleting an unknown hash
   used to report `removed: 1`, and `hashes=[]` reported `applied_to: all` while
   changing nothing.
 - A list element containing `|` is refused, rather than becoming two hashes.
+- A URL too long to build is a transport error, not a bare tool error.
+
+### Dependencies
+
+- `mcp` is capped at `<3`, because strict tool arguments rely on private SDK
+  attributes.
 
 ## [0.1.3] — 2026-11-04
 

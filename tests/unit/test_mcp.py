@@ -61,7 +61,7 @@ def test_qbt_call_can_reach_every_endpoint() -> None:
 def test_destructive_refusal_is_structured() -> None:
     out = call(
         "qbt_call",
-        {"path": "torrents/delete", "params": {"hashes": "all", "deleteFiles": True}},
+        {"path": "torrents/delete", "params": {"hashes": "ab" * 20, "deleteFiles": True}},
     )
     assert out["refused"] == "confirmation_required"
     assert "confirm=true" in out["remedy"]

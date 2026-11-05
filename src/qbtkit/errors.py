@@ -133,11 +133,27 @@ class ConfirmationRequired(QbtError):
     """A destructive call was attempted without explicit confirmation."""
 
 
+class EveryTorrentNeedsConfirm(ConfirmationRequired):
+    """A call names every torrent, and hasn't confirmed that.
+
+    Its own type because the answer differs from a destructive call's: most of
+    these can be undone, and the better next step is to name the torrents.
+    """
+
+
 class MissingTargets(QbtError):
     """A call acting on torrents doesn't clearly say which ones.
 
     Omitted or empty hashes used to mean every torrent, or nothing while
     reporting every torrent, so the mistake was invisible to whoever made it.
+    """
+
+
+class MissingTags(QbtError):
+    """A tag call leaves out which tags, or names a blank one.
+
+    qBittorrent reads that as every tag: measured on 4.4.5 through 5.2.3, removing
+    "" took all of a torrent's tags off and reported success.
     """
 
 

@@ -160,6 +160,8 @@ class _Server:
     def call(self, path: str, /, *, confirm: bool = False, **kw: Any) -> object:
         self.calls.append((path, {"confirm": confirm, **kw}))
         if path == "torrents/info":
+            if "hashes" not in kw:
+                return [{"hash": h} for h in self.known]
             wanted = {str(h).lower() for h in kw["hashes"]}
             return [{"hash": h} for h in self.known if h in wanted]
         return None
@@ -185,7 +187,7 @@ def test_control_refuses_when_nothing_is_named(args: dict) -> None:
 
 def test_control_of_every_torrent_needs_confirm() -> None:
     out = call("control_torrents", {"action": "recheck", "hashes": ["all"]})
-    assert out["refused"] == "confirmation_required"
+    assert out["refused"] == "every_torrent_needs_confirm"
 
 
 def test_control_reports_all_when_all_was_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -286,7 +288,7 @@ def test_tagging_refuses_when_no_torrent_is_named(action: str) -> None:
 @pytest.mark.parametrize("action", ["add", "remove"])
 def test_tagging_every_torrent_needs_confirm(action: str) -> None:
     out = call("tags", {"action": action, "names": ["x"], "hashes": ["all"]})
-    assert out["refused"] == "confirmation_required"
+    assert out["refused"] == "every_torrent_needs_confirm"
 
 
 def test_tagging_every_torrent_with_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -353,7 +355,7 @@ def test_deleting_still_needs_confirm_first() -> None:
 
 def test_qbt_call_is_gated_too() -> None:
     out = call("qbt_call", {"path": "torrents/recheck", "params": {"hashes": "all"}})
-    assert out["refused"] == "confirmation_required"
+    assert out["refused"] == "every_torrent_needs_confirm"
     out = call("qbt_call", {"path": "torrents/recheck", "params": {"hashes": []}})
     assert out["refused"] == "hashes_required"
     out = call("qbt_call", {"path": "torrents/recheck"})
@@ -415,3 +417,198 @@ def test_editing_a_category_to_an_empty_path_stays_possible(
     monkeypatch.setattr(S, "_client", lambda: fake)
     assert call("categories", {"action": "edit", "name": "tv", "save_path": ""})["ok"] is True
     assert fake.sent("torrents/editCategory")[0]["savePath"] == ""
+
+
+# --------------------------------------------------------------- long hash lists
+
+
+@pytest.mark.parametrize("count", [501, 2000, 20000])
+def test_a_long_list_is_looked_up_without_a_url_full_of_hashes(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    """The lookup is a GET: about 2,000 hashes made a URL httpx refuses to build."""
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    many = [HASH] + [f"{i:040x}" for i in range(count - 1)]
+    out = call("control_torrents", {"action": "stop", "hashes": many})
+    assert out["applied_to"] == 1
+    assert len(out["not_found"]) == count - 1
+    assert "hashes" not in fake.sent("torrents/info")[0]
+    assert fake.sent("torrents/stop")[0]["hashes"] == many
+
+
+def test_a_short_list_is_still_filtered_by_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    many = [HASH] + [f"{i:040x}" for i in range(499)]
+    call("control_torrents", {"action": "stop", "hashes": many})
+    assert fake.sent("torrents/info")[0]["hashes"] == many
+
+
+def test_a_url_too_long_to_build_is_a_transport_error() -> None:
+    """Not an httpx exception, so nothing above the client would catch it."""
+    url = "http://127.0.0.1:1/api/v2/torrents/info?hashes=" + "a" * 100_000
+    with pytest.raises(errors.TransportError):
+        _agent()._get(url)
+
+
+# ----------------------------------------------------------------- moving
+
+
+def test_moving_an_unknown_hash_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _Server()
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("move_torrents", {"hashes": [OTHER], "location": "/x"})
+    assert out["refused"] == "unknown_torrents"
+    assert not fake.sent("torrents/setLocation")
+
+
+def test_moving_reports_what_it_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("move_torrents", {"hashes": [HASH, OTHER], "location": "/x"})
+    assert out["moved"] == 1
+    assert out["not_found"] == [OTHER]
+    assert fake.sent("torrents/setLocation") == [
+        {"confirm": False, "hashes": [HASH, OTHER], "location": "/x"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "args", [{"location": "/x"}, {"hashes": [], "location": "/x"}], ids=["omitted", "empty"]
+)
+def test_moving_nothing_is_refused(args: dict) -> None:
+    if "hashes" not in args:
+        with pytest.raises(ToolError, match="hashes"):
+            raw("move_torrents", args)
+        return
+    assert call("move_torrents", args)["refused"] == "hashes_required"
+
+
+def test_moving_every_torrent_needs_a_confirm_the_tool_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It used to say to re-send with confirm, and then reject confirm."""
+    out = call("move_torrents", {"hashes": ["all"], "location": "/x"})
+    assert out["refused"] == "every_torrent_needs_confirm"
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("move_torrents", {"hashes": ["all"], "location": "/x", "confirm": True})
+    assert out["moved"] == "all"
+    assert fake.sent("torrents/setLocation") == [
+        {"confirm": True, "hashes": ["all"], "location": "/x"}
+    ]
+
+
+def test_moving_and_rechecking_every_torrent_confirms_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    args = {"hashes": ["all"], "location": "/x", "confirm": True}
+    call("move_torrents", {**args, "recheck": True})
+    assert fake.sent("torrents/recheck") == [{"confirm": True, "hashes": ["all"]}]
+
+
+def test_moving_doesnt_recheck_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recheck rehashes everything, so on large data it's slow."""
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("move_torrents", {"hashes": [HASH], "location": "/x"})
+    assert out["rechecking"] is False
+    assert not fake.sent("torrents/recheck")
+
+
+# ------------------------------------------------------- what actually gets sent
+
+
+@pytest.mark.parametrize("delete_files", [False, True], ids=["keep files", "delete files"])
+def test_deleting_sends_exactly_what_was_asked(
+    monkeypatch: pytest.MonkeyPatch, delete_files: bool
+) -> None:
+    """A wrong flag here is data loss, and the refusal tests can't see it."""
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    call("delete_torrents", {"hashes": [HASH], "delete_files": delete_files, "confirm": True})
+    assert fake.sent("torrents/delete") == [
+        {"confirm": True, "hashes": [HASH], "deleteFiles": delete_files}
+    ]
+
+
+def test_deleting_keeps_the_files_unless_told(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("delete_torrents", {"hashes": [HASH], "confirm": True})
+    assert out["files_deleted"] is False
+    assert fake.sent("torrents/delete")[0]["deleteFiles"] is False
+
+
+@pytest.mark.parametrize(
+    ("action", "path"), [("add", "torrents/addTags"), ("remove", "torrents/removeTags")]
+)
+def test_tagging_sends_exactly_what_was_asked(
+    monkeypatch: pytest.MonkeyPatch, action: str, path: str
+) -> None:
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    call("tags", {"action": action, "names": ["x", "y"], "hashes": [HASH]})
+    assert fake.sent(path) == [{"confirm": False, "hashes": [HASH], "tags": ["x", "y"]}]
+
+
+# ---------------------------------------------------------------- blank tag names
+
+
+@pytest.mark.parametrize("action", ["add", "remove"])
+@pytest.mark.parametrize("names", [[""], ["  "], ["x", ""]], ids=["empty", "blank", "mixed"])
+def test_a_blank_tag_name_is_refused(
+    monkeypatch: pytest.MonkeyPatch, action: str, names: list[str]
+) -> None:
+    """Measured: removing "" took every tag off the torrent and reported ok."""
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("tags", {"action": action, "names": names, "hashes": [HASH]})
+    assert out["refused"] == "tags_required"
+    assert not [p for p, _ in fake.calls if p != "torrents/info"]
+
+
+@pytest.mark.parametrize("path", ["torrents/addTags", "torrents/removeTags"])
+@pytest.mark.parametrize(
+    "params",
+    [{}, {"tags": ""}, {"tags": []}, {"tags": ["x", " "]}, {"tags": "x| "}],
+    ids=["omitted", "empty", "empty list", "blank in list", "blank in string"],
+)
+def test_qbt_call_can_not_name_every_tag_by_omission(path: str, params: dict) -> None:
+    out = call("qbt_call", {"path": path, "params": {"hashes": [HASH], **params}})
+    assert out["refused"] == "tags_required"
+
+
+def test_a_person_at_the_cli_can_still_remove_every_tag() -> None:
+    with pytest.raises(errors.TransportError):
+        _person().call("torrents/removeTags", hashes=[HASH])
+
+
+# ------------------------------------------------------------ what a refusal says
+
+
+def test_the_every_torrent_refusal_points_at_naming_them() -> None:
+    """The shortest way past this gate shouldn't be the first thing it suggests."""
+    out = call("control_torrents", {"action": "stop", "hashes": ["all"]})
+    assert out["remedy"].startswith("name the torrents")
+    assert "ask the user" in out["remedy"]
+    assert "cannot be undone" not in out["remedy"]
+
+
+def test_a_destructive_refusal_keeps_its_own_wording() -> None:
+    out = call("delete_torrents", {"hashes": [HASH]})
+    assert out["refused"] == "confirmation_required"
+
+
+def test_a_rejected_argument_doesnt_echo_its_value() -> None:
+    """Every other reply is scrubbed, and this error isn't."""
+    secret = "http://t.invalid/announce?passkey=FAKEFAKEFAKE"
+    with pytest.raises(ToolError) as e:
+        raw("control_torrents", {"action": "stop", "hash": secret})
+    assert "hash" in str(e.value)
+    assert "FAKEFAKEFAKE" not in str(e.value)
+    assert "Strict" not in str(e.value)
+    assert "control_torrents" in str(e.value)

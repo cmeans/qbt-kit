@@ -42,10 +42,6 @@ API allows. The gates are therefore code, not prompt text:
 
 - Destructive endpoints require explicit `confirm`; `delete_files` is never
   implied.
-- A model has to name the torrents a mutating call acts on. Empty hashes are
-  refused, and `all` needs `confirm`, on every endpoint including through
-  `qbt_call`. The CLI still takes `all` as typed. An argument a tool doesn't
-  declare is an error, so a typo can't drop a target or a flag.
 - `--read-only` / `QBT_READ_ONLY=1` refuses every mutating endpoint, **including
   through `qbt_call`**, so the escape hatch cannot be used to escape the gate.
 - `app/setPreferences` takes an **allowlist**, `SAFE_PREF_KEYS`. Keys outside it

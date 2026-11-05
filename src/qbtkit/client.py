@@ -109,6 +109,9 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+_NAMES_TAGS = frozenset({"torrents/addTags", "torrents/removeTags"})
+
+
 def _check_targets(path: str, name: str, value: Any, confirm: bool) -> None:
     """Make a model say which torrents it means.
 
@@ -125,10 +128,17 @@ def _check_targets(path: str, name: str, value: Any, confirm: bool) -> None:
     if len(named) > 1:
         raise errors.MissingTargets(f'{path}: {name} mixes "all" with specific hashes')
     if not confirm:
-        raise errors.ConfirmationRequired(
+        raise errors.EveryTorrentNeedsConfirm(
             f"{path} would act on every torrent; name the ones you mean, or "
             f"pass confirm=True if every torrent is what was asked for"
         )
+
+
+def _check_tags(path: str, value: Any) -> None:
+    """Make a model say which tags it means, for the same reason as `_check_targets`."""
+    items = [] if value is None else value.split("|") if isinstance(value, str) else list(value)
+    if not items or any(not str(item).strip() for item in items):
+        raise errors.MissingTags(f"{path}: tags can't be left out or blank; got {value!r}")
 
 
 def encode(param_wire: Wire, value: Any) -> str | tuple[str, bytes]:
@@ -136,7 +146,7 @@ def encode(param_wire: Wire, value: Any) -> str | tuple[str, bytes]:
     if param_wire is Wire.BOOL_STR:
         return "true" if _as_bool(value) else "false"
     if param_wire is Wire.HASHES:
-        if value == ALL or value is None:
+        if value == ALL:
             return ALL
         if isinstance(value, str):
             return value
@@ -219,13 +229,13 @@ class Client:
     def _get(self, url: str, **kw: Any) -> httpx.Response:
         try:
             return self._http.get(url, **kw)
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             raise errors.TransportError(f"GET {url}: {e}") from e
 
     def _post(self, url: str, **kw: Any) -> httpx.Response:
         try:
             return self._http.post(url, **kw)
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             raise errors.TransportError(f"POST {url}: {e}") from e
 
     # ----------------------------------------------------------------- auth
@@ -411,6 +421,8 @@ class Client:
             for p in ep.params:
                 if p.wire is Wire.HASHES and (p.required or p.name in params):
                     _check_targets(ep.path, p.name, params.get(p.name), confirm)
+            if ep.path in _NAMES_TAGS:
+                _check_tags(ep.path, params.get("tags"))
 
         if ep.destructive and not confirm:
             raise errors.ConfirmationRequired(

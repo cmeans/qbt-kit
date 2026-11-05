@@ -157,7 +157,6 @@ def test_cli_command_naming() -> None:
         (Wire.BOOL_STR, True, "true"),
         (Wire.BOOL_STR, False, "false"),
         (Wire.HASHES, "all", "all"),
-        (Wire.HASHES, None, "all"),
         (Wire.HASHES, ["a", "b"], "a|b"),
         (Wire.PIPE_LIST, ["x", "y"], "x|y"),
         (Wire.PIPE_LIST, "x|y", "x|y"),

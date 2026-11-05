@@ -32,7 +32,9 @@ dependencies = [
 # qbtkit.mcp only; pydantic arrives with mcp anyway but is imported directly,
 # and an undeclared import is a break waiting for mcp to drop it.
 mcp = [
-  "mcp>=2.3",        # current major is 2.x; a 1.x floor resolves a dead API
+  # Current major is 2.x, and a 1.x floor resolves a dead API. Capped because
+  # strict tool arguments rely on private SDK attributes.
+  "mcp>=2.3,<3",
   "pydantic>=2.0",   # Field(), for the tool argument schemas
 ]
 
