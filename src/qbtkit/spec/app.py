@@ -62,6 +62,134 @@ LOCKOUT_KEYS = frozenset(
         "autorun_program",
         "autorun_on_torrent_added_enabled",
         "autorun_on_torrent_added_program",
+        # The same outcome by a second route, missed when autorun_program was
+        # blocked: qBittorrent runs this binary for every plugin search, so
+        # pointing it at any executable already on the host and then searching
+        # runs that file. Reported externally against 0.1.2.
+        "python_executable_path",
+    }
+)
+
+# Keys a language model may write. Everything else is refused on the agent path
+# and warned about on the CLI.
+#
+# This is an allowlist because the blocklist above, which is careful and well
+# reasoned, still missed three routes to code execution and mass data deletion.
+# A blocklist has to anticipate every dangerous key, including ones qBittorrent
+# has not shipped yet; an allowlist only has to recognise the harmless ones, and
+# fails closed when a new key appears.
+#
+# The exclusions follow principles rather than a list. Not here, deliberately:
+# anything naming a path the *server* writes (`export_dir*`, `file_log_path`,
+# `scan_dirs`); anything naming a host, URL or program (`proxy_*`, `dyndns_*`,
+# `mail_notification_*`, `i2p_*`, `announce_ip`); anything changing who is
+# trusted (`add_trackers*`, `ignore_ssl_errors`, `ssrf_mitigation`,
+# `validate_https_tracker_certificate`, `embedded_tracker*`); the share-limit
+# *action* and its triggers, because `max_ratio_act` 1 and 3 delete every
+# finished torrent's data and the user may already have set it; and
+# `current_network_interface`/`current_interface_address`, which silently stop
+# all transfers.
+SAFE_PREF_KEYS = frozenset(
+    {
+        # Rate limits and the scheduler.
+        "dl_limit",
+        "up_limit",
+        "alt_dl_limit",
+        "alt_up_limit",
+        "bittorrent_protocol",
+        "limit_lan_peers",
+        "limit_tcp_overhead",
+        "limit_utp_rate",
+        "scheduler_enabled",
+        "scheduler_days",
+        "schedule_from_hour",
+        "schedule_from_min",
+        "schedule_to_hour",
+        "schedule_to_min",
+        # Queueing.
+        "queueing_enabled",
+        "max_active_downloads",
+        "max_active_torrents",
+        "max_active_uploads",
+        "max_active_checking_torrents",
+        "dont_count_slow_torrents",
+        "slow_torrent_dl_rate_threshold",
+        "slow_torrent_ul_rate_threshold",
+        "slow_torrent_inactive_timer",
+        # Paths the user already owns, and how content is laid out.
+        "save_path",
+        "temp_path",
+        "temp_path_enabled",
+        "auto_tmm_enabled",
+        "torrent_changed_tmm_enabled",
+        "save_path_changed_tmm_enabled",
+        "category_changed_tmm_enabled",
+        "torrent_content_layout",
+        "add_stopped_enabled",
+        "start_paused_enabled",
+        "preallocate_all",
+        "incomplete_files_ext",
+        "auto_delete_mode",
+        "recheck_completed_torrents",
+        # Connectivity that is not the WebUI.
+        "listen_port",
+        "random_port",
+        "upnp",
+        "dht",
+        "pex",
+        "lsd",
+        "encryption",
+        "anonymous_mode",
+        "max_connec",
+        "max_connec_per_torrent",
+        "max_uploads",
+        "max_uploads_per_torrent",
+        "utp_tcp_mixed_mode",
+        "outgoing_ports_min",
+        "outgoing_ports_max",
+        "enable_multi_connections_from_same_ip",
+        # RSS, toggles and intervals only; feed URLs live in the rss scope.
+        "rss_processing_enabled",
+        "rss_refresh_interval",
+        "rss_max_articles_per_feed",
+        "rss_auto_downloading_enabled",
+        "rss_download_repack_proper_episodes",
+        # libtorrent performance knobs.
+        "async_io_threads",
+        "hashing_threads",
+        "file_pool_size",
+        "checking_memory_use",
+        "disk_cache",
+        "disk_cache_ttl",
+        "disk_queue_size",
+        "disk_io_type",
+        "disk_io_read_mode",
+        "disk_io_write_mode",
+        "send_buffer_watermark",
+        "send_buffer_low_watermark",
+        "send_buffer_watermark_factor",
+        "socket_backlog_size",
+        "socket_send_buffer_size",
+        "socket_receive_buffer_size",
+        "connection_speed",
+        "peer_turnover",
+        "peer_turnover_cutoff",
+        "peer_turnover_interval",
+        "request_queue_size",
+        "upload_slots_behavior",
+        "upload_choking_algorithm",
+        "enable_coalesce_read_write",
+        "enable_piece_extent_affinity",
+        "enable_upload_suggestions",
+        "announce_to_all_tiers",
+        "announce_to_all_trackers",
+        "stop_tracker_timeout",
+        "max_concurrent_http_announces",
+        "reannounce_when_address_changed",
+        "idn_support_enabled",
+        "resume_data_storage_type",
+        "refresh_interval",
+        "resolve_peer_countries",
     }
 )
 
@@ -119,6 +247,7 @@ register(
                 required=True,
                 summary="object of preference keys to set",
                 blocklist=LOCKOUT_KEYS,
+                allowlist=SAFE_PREF_KEYS,
             ),
         ),
         mutating=True,
@@ -160,6 +289,11 @@ register(
         since=(2, 11, 2),
         summary="Cookies qBittorrent sends when fetching .torrent URLs.",
         returns=Json("Cookie"),
+        # The whole reply is credentials — private-tracker session cookies — and
+        # nothing an agent does with torrents needs to read them. Forbidding
+        # beats redacting: a cookie's secret is in a field called `value`, and
+        # redacting by that name is both too broad elsewhere and too narrow here.
+        agent_forbidden=True,
     ),
     Endpoint(
         scope="app",
@@ -171,6 +305,10 @@ register(
         body=Body.URLENCODED,
         params=(Param("cookies", Wire.JSON_BLOB, required=True),),
         mutating=True,
+        # "Replace" means the user's private-tracker cookies are gone, which is
+        # this codebase's own definition of destructive, and it could instead
+        # plant a cookie sent to every .torrent URL qBittorrent fetches.
+        agent_forbidden=True,
     ),
     Endpoint(
         scope="app",

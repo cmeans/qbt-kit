@@ -112,6 +112,19 @@ class BlockedParameter(QbtError):
     """
 
 
+class AgentForbidden(QbtError):
+    """A call no language model may make, whatever it passes.
+
+    `confirm` is set by the model, not by the person reading the transcript, so
+    it is evidence of intent and not of consent. It is the right gate for
+    irreversible loss of the user's *own* data, which they can be asked about.
+    It is the wrong gate for handing a third party code execution, a credential
+    or a redirect, because the model can simply pass it. Those calls are refused
+    on the agent path with no override, and stay available on the CLI where a
+    person is typing.
+    """
+
+
 class ReadOnly(QbtError):
     """A mutating call was attempted while the client is in read-only mode."""
 

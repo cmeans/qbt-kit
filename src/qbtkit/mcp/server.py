@@ -26,6 +26,7 @@ from pydantic import Field
 from .. import errors
 from ..client import Client
 from ..spec import load_all
+from .scrub import scrub, scrub_text, scrub_url
 
 server = MCPServer(
     name="qbt-kit",
@@ -67,32 +68,6 @@ BRIEF = (
 )
 
 
-# Substrings that mark a value as a credential. qBittorrent hands its own API
-# key and several passwords back from app/preferences in plaintext, so anything
-# echoing that object has to strip them first.
-_SECRET_HINTS = ("password", "api_key", "apikey", "secret", "token")
-
-REDACTED = "<redacted by qbt-kit; read it from the server if you truly need it>"
-
-
-def _redact(value: Any) -> Any:
-    """Strip credential-shaped values from anything on its way to the model.
-
-    Returning a secret into a model's context puts it in transcripts, logs and
-    anywhere that context is later sent, and no amount of instruction undoes
-    that. Empty values are left alone so a caller can still tell whether a key
-    is set at all, which is usually the real question.
-    """
-    if isinstance(value, dict):
-        return {
-            k: (REDACTED if any(h in k.lower() for h in _SECRET_HINTS) and v else _redact(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact(v) for v in value]
-    return value
-
-
 def _safe(fn: Callable[..., str]) -> Callable[..., str]:
     """Turn a refusal into an answer the model can act on.
 
@@ -102,8 +77,7 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
     structured JSON naming the cause and the remedy.
     """
 
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> str:
+    def _dispatch(*args: Any, **kwargs: Any) -> str:
         try:
             return fn(*args, **kwargs)
         except errors.ConfirmationRequired as e:
@@ -133,6 +107,20 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
                     "detail": str(e),
                     "remedy": "there is no override. Change the setting in "
                     "qBittorrent directly if it is genuinely wanted",
+                },
+                indent=2,
+            )
+        except errors.AgentForbidden as e:
+            # Worth a distinct refusal rather than folding into the one above:
+            # told "blocked", a model reasonably tries confirm=true next. This
+            # says the override does not exist and names who can do it instead.
+            return json.dumps(
+                {
+                    "refused": "agent_forbidden",
+                    "detail": str(e),
+                    "remedy": "no confirmation permits this through MCP, because "
+                    "a model sets confirm itself. Ask the user to do it in "
+                    "qBittorrent or with the `qbt` CLI.",
                 },
                 indent=2,
             )
@@ -172,7 +160,54 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
         except errors.QbtError as e:
             return json.dumps({"error": type(e).__name__, "detail": str(e)}, indent=2)
 
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        # Scrub on the way out, including the refusals above: ApiError carries
+        # the first 200 characters of the server's body, which on a 409 can be a
+        # tracker URL, and TransportError carries the configured server URL.
+        return _scrub_payload(_dispatch(*args, **kwargs))
+
+    # A marker, not decoration: a unit test reads it off every tool the MCP
+    # server has registered, so adding a tool with bare `@server.tool` fails
+    # the suite instead of silently returning unscrubbed output.
+    setattr(wrapper, "__qbt_scrubbed__", True)  # noqa: B010
     return wrapper
+
+
+def _scrub_payload(text: str) -> str:
+    """Decode, walk, re-encode once.
+
+    Walking the object is what reaches dict keys — `sync/maindata` keys its
+    trackers map by announce URL — and avoids `json.dumps` escaping non-ASCII to
+    `\\uXXXX`, which would hide a URL from any pattern applied to the text.
+    """
+    if not isinstance(text, str):
+        # A tool returning a dict would have MCP serialise it downstream of this
+        # wrapper, where nothing scrubs it. Fail loudly rather than leak quietly.
+        raise TypeError(
+            f"MCP tools must return a JSON string so it can be scrubbed; "
+            f"got {type(text).__name__}"
+        )
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return scrub_text(text)
+    return json.dumps(scrub(data), indent=2, default=str)
+
+
+def _tool(**kw: Any) -> Callable[[Callable[..., str]], Callable[..., str]]:
+    """Register a tool and scrub its output in one act.
+
+    Two call sites of the old key-name redaction, and thirteen tools that did
+    not call it, is what the external report found. Registration and scrubbing
+    being separate decorators is what made forgetting possible, so they are one
+    decorator now and there is no path to `server.tool` that skips the scrub.
+    """
+
+    def decorate(fn: Callable[..., str]) -> Callable[..., str]:
+        return server.tool(**kw)(_safe(fn))  # type: ignore[no-any-return]
+
+    return decorate
 
 
 def _client() -> Client:
@@ -182,6 +217,9 @@ def _client() -> Client:
         password=_OPTS["password"],
         api_key=_OPTS["api_key"],
         read_only=_OPTS["read_only"],
+        # Every client this process builds is driven by a model, so the stricter
+        # gates apply to all of them — including the ones `qbt_call` uses.
+        agent=True,
     )
 
 
@@ -199,8 +237,7 @@ def _hashes(value: str | list[str] | None) -> str | list[str]:
 # reading
 
 
-@server.tool(description="List torrents, with the fields that usually matter.")
-@_safe
+@_tool(description="List torrents, with the fields that usually matter.")
 def list_torrents(
     status: Annotated[
         str | None,
@@ -222,8 +259,7 @@ def list_torrents(
     return json.dumps({"count": len(rows), "torrents": out}, indent=2)
 
 
-@server.tool(description="Properties, trackers and files for one torrent.")
-@_safe
+@_tool(description="Properties, trackers and files for one torrent.")
 def torrent_detail(
     hash: Annotated[str, Field(description="torrent hash")],
 ) -> str:
@@ -238,7 +274,7 @@ def torrent_detail(
         )
 
 
-@server.tool(
+@_tool(
     description=(
         "Judge whether each torrent can actually finish. `availability` is how many "
         "complete copies exist across reachable peers; when it does not exceed "
@@ -249,7 +285,6 @@ def torrent_detail(
         "that are 100% yet never fetched their deselected files."
     )
 )
-@_safe
 def swarm_health(
     include_complete: Annotated[
         bool, Field(description="also report torrents already at 100%")
@@ -325,8 +360,7 @@ def swarm_health(
     )
 
 
-@server.tool(description="Global transfer rates, limits and connection status.")
-@_safe
+@_tool(description="Global transfer rates, limits and connection status.")
 def transfer_status() -> str:
     with _client() as c:
         return json.dumps(
@@ -340,15 +374,14 @@ def transfer_status() -> str:
         )
 
 
-@server.tool(description="Server version, auth mode and endpoint availability.")
-@_safe
+@_tool(description="Server version, auth mode and endpoint availability.")
 def server_info() -> str:
     with _client() as c:
         version = c.version
         eps = load_all()
         return json.dumps(
             {
-                "url": c.url,
+                "url": scrub_url(c.url),
                 "qbittorrent": c.call("app/version"),
                 "webapi": ".".join(map(str, version)),
                 "auth_mode": c.auth_mode,
@@ -365,8 +398,7 @@ def server_info() -> str:
 # writing
 
 
-@server.tool(description="Add a torrent by magnet or URL, or several at once.")
-@_safe
+@_tool(description="Add a torrent by magnet or URL, or several at once.")
 def add_torrent(
     urls: Annotated[list[str], Field(description="magnet or http(s) URLs")],
     category: Annotated[str | None, Field(description="category to file it under")] = None,
@@ -405,13 +437,12 @@ def add_torrent(
     return json.dumps({"result": result}, indent=2)
 
 
-@server.tool(
+@_tool(
     description=(
         "Start, stop, recheck or reannounce torrents. Note that force_start makes a "
         "torrent ignore share limits, so a stop-on-complete rule stops applying to it."
     )
 )
-@_safe
 def control_torrents(
     action: Annotated[
         str, Field(description="start, stop, recheck, reannounce, force_start, unforce_start")
@@ -436,13 +467,12 @@ def control_torrents(
     return json.dumps({"ok": True, "action": action, "applied_to": hashes or "all"}, indent=2)
 
 
-@server.tool(
+@_tool(
     description=(
         "Remove torrents. `delete_files` is never implied: without it the data stays "
         "on disk. Requires confirm=True because it cannot be undone."
     )
 )
-@_safe
 def delete_torrents(
     hashes: Annotated[
         list[str],
@@ -464,14 +494,13 @@ def delete_torrents(
     )
 
 
-@server.tool(
+@_tool(
     description=(
         "Move a torrent's data to a new location. qBittorrent performs the move and "
         "the torrent stays valid; the call returns before the move finishes. A "
         "recheck afterwards is optional because it rehashes everything."
     )
 )
-@_safe
 def move_torrents(
     hashes: Annotated[list[str], Field(description="torrent hashes")],
     location: Annotated[str, Field(description="destination directory")],
@@ -489,8 +518,7 @@ def move_torrents(
     )
 
 
-@server.tool(description="List, create, edit or remove categories.")
-@_safe
+@_tool(description="List, create, edit or remove categories.")
 def categories(
     action: Annotated[str, Field(description="list, create, edit or remove")] = "list",
     name: Annotated[str | None, Field(description="category name")] = None,
@@ -513,8 +541,7 @@ def categories(
     return json.dumps({"ok": True, "action": action, "category": name}, indent=2)
 
 
-@server.tool(description="List, create, delete, add or remove tags.")
-@_safe
+@_tool(description="List, create, delete, add or remove tags.")
 def tags(
     action: Annotated[str, Field(description="list, create, delete, add or remove")] = "list",
     names: Annotated[list[str] | None, Field(description="tag names")] = None,
@@ -541,14 +568,13 @@ def tags(
     return json.dumps({"ok": True, "action": action, "tags": names}, indent=2)
 
 
-@server.tool(
+@_tool(
     description=(
         "Read preferences, or write a subset. Keys that would sever this connection "
         "or weaken the server's security (WebUI port, password, host-header "
         "validation and similar) are refused outright, with no override."
     )
 )
-@_safe
 def preferences(
     action: Annotated[str, Field(description="read or write")] = "read",
     values: Annotated[
@@ -561,20 +587,19 @@ def preferences(
             prefs = c.call("app/preferences")
             if keys:
                 prefs = {k: prefs.get(k) for k in keys}
-            return json.dumps(_redact(prefs), indent=2)
+            return json.dumps(prefs, indent=2)
         if not values:
             return json.dumps({"error": "values is required for write"})
         c.call("app/setPreferences", json=values)
     return json.dumps({"ok": True, "set": sorted(values)}, indent=2)
 
 
-@server.tool(
+@_tool(
     description=(
         "Run a plugin search: start it, poll until it settles, return the results. "
         "Requires qBittorrent to have search plugins installed."
     )
 )
-@_safe
 def search(
     pattern: Annotated[str, Field(description="what to search for")],
     plugins: Annotated[str, Field(description='plugin names, "all" or "enabled"')] = "enabled",
@@ -604,7 +629,7 @@ def search(
 # the escape hatch
 
 
-@server.tool(
+@_tool(
     description=(
         "Call any qBittorrent endpoint directly as scope/name, for anything the "
         "tools above do not cover. Parameters are validated against the endpoint "
@@ -612,7 +637,6 @@ def search(
         "and read-only mode refuses anything that mutates state."
     )
 )
-@_safe
 def qbt_call(
     path: Annotated[str, Field(description="scope/name, e.g. torrents/pieceStates")],
     params: Annotated[dict[str, Any] | None, Field(description="endpoint parameters")] = None,
@@ -624,11 +648,10 @@ def qbt_call(
         return json.dumps(
             {"bytes": len(result), "note": "binary response, not returned inline"}
         )
-    return json.dumps({"result": _redact(result)}, indent=2, default=str)
+    return json.dumps({"result": result}, indent=2, default=str)
 
 
-@server.tool(description="List every endpoint qbt_call can reach, with its shape.")
-@_safe
+@_tool(description="List every endpoint qbt_call can reach, with its shape.")
 def list_endpoints(
     scope: Annotated[str | None, Field(description="filter to one scope")] = None,
     mutating_only: Annotated[
@@ -648,7 +671,11 @@ def list_endpoints(
                 "summary": e.summary,
                 "mutating": e.mutating,
                 "destructive": e.destructive,
+                # Advertised so a model can see a wall before walking into it,
+                # rather than discovering it as a refusal.
+                "agent_forbidden": e.agent_forbidden,
                 "params": [p.name for p in e.params],
+                "agent_forbidden_params": [p.name for p in e.params if p.agent_forbidden],
                 "since": ".".join(map(str, e.since)) if e.since else None,
             }
         )

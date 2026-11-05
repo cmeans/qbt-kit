@@ -4,6 +4,54 @@ Notable changes to qbt-kit. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-11-04
+
+Two vulnerabilities reported privately by Chris Means, both affecting
+`<= 0.1.2` through the MCP server. The CLI was never affected. Upgrade if you
+run `qbt-mcp`, particularly against a private tracker.
+
+### Security
+
+- **Private-tracker passkeys reached the language model.** Redaction matched
+  dict key names, and a passkey lives inside a URL, so it passed through
+  `list_torrents(full=true)`, `torrent_detail`, `torrents/trackers`,
+  `sync/maindata`, `app/cookies` and others. `QBT_READ_ONLY` did not help,
+  because these are reads. Every MCP reply is now scrubbed in one place that
+  tool registration cannot skip. Announce and scrape URLs keep only scheme,
+  host and port; credential-named query parameters and path siblings go; magnet
+  `tr`/`xs`/`as`/`ws` values get the same treatment; and a literal learned from
+  any of those is removed everywhere else in the same reply. Tracker hostnames
+  and infohashes are deliberately kept.
+- **The preference gate missed several routes to deletion and code execution.**
+  `max_ratio_act` with a zero limit deleted every finished torrent's data with
+  no confirmation; `search/installPlugin` executed third-party Python inside
+  qBittorrent; `python_executable_path` ran a file already on the host;
+  `proxy_*`, `export_dir`, `scan_dirs` and `add_trackers` sent data elsewhere;
+  `torrentcreator/addTask` overwrote a chosen file and announced qBittorrent's
+  own configuration directory. `app/setPreferences` now takes an allowlist
+  rather than a blocklist, so a key nobody anticipated fails closed.
+- **Some calls are refused to a model outright**, with no `confirm` override,
+  and stay available on the CLI: `search/installPlugin`, `search/updatePlugins`,
+  `app/cookies`, `app/setCookies`, `torrents/SSLParameters`, and `addTask`'s
+  `torrentFilePath` and `startSeeding`. `confirm` is set by the model, so it is
+  evidence of intent rather than consent: the right gate for losing your own
+  data, the wrong one for handing a third party code execution or a credential.
+- `torrents/setShareLimits` is now destructive. Reaching a limit deletes data
+  when `max_ratio_act` is 1 or 3, so it had `torrents/delete`'s outcome without
+  its gate.
+
+### Changed
+
+- Scrubbing announce URLs is one-way. A redacted tracker URL cannot be passed
+  back to `torrents/editTracker`, and a redacted `fileUrl` cannot be passed back
+  to `search/downloadTorrent`, so on a private tracker those are CLI jobs now. A
+  reversible token would restore them and would also let the model build a new
+  URL around the token and leak through `torrents/addTrackers`.
+- SECURITY.md documents a residual neither report covered: `savepath` on
+  `torrents/add` and its relatives is an arbitrary file write, reachable through
+  the ordinary tools and so not refusable. Run qBittorrent as a user that cannot
+  write outside its own data.
+
 ## [0.1.2] — 2026-10-19
 
 ### Fixed
