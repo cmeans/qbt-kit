@@ -4,6 +4,33 @@ Notable changes to qbt-kit. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **MCP tools now have to name the torrents they act on.** `control_torrents`
+  and `tags` add/remove used to treat omitted hashes as every torrent, with no
+  confirmation. They now refuse with `hashes_required`. Every torrent takes
+  `hashes=["all"]` and `confirm=true`, and the same gate covers `qbt_call`. The
+  CLI still accepts `all`.
+- **Unknown MCP tool arguments are errors.** A mistyped `hash` used to be dropped,
+  which turned a call for one torrent into a call for all of them, and
+  `delete_file=true` kept the files. Tool schemas now set
+  `additionalProperties: false`.
+- `preferences` refuses an unknown action, where `writ` used to write.
+  `categories` edit requires `save_path`, because leaving it out cleared the
+  path; pass `""` to clear it on purpose.
+
+### Fixed
+
+- `control_torrents`, `tags` and `delete_torrents` report what the server has
+  rather than repeating the request. `applied_to` and `removed` are counts of
+  torrents found, or `"all"`, with the rest in `not_found`. If none exist, the call
+  is refused with `unknown_torrents` and nothing is sent. Deleting an unknown hash
+  used to report `removed: 1`, and `hashes=[]` reported `applied_to: all` while
+  changing nothing.
+- A list element containing `|` is refused, rather than becoming two hashes.
+
 ## [0.1.3] — 2026-11-04
 
 Two vulnerabilities reported privately by Chris Means, both affecting

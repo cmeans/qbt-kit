@@ -21,10 +21,10 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from .. import errors
-from ..client import Client
+from ..client import ALL, Client
 from ..spec import load_all
 from .scrub import scrub, scrub_text, scrub_url
 
@@ -87,6 +87,27 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
                     "detail": str(e),
                     "remedy": "re-send the same call with confirm=true if this is "
                     "really intended; it cannot be undone",
+                },
+                indent=2,
+            )
+        except errors.MissingTargets as e:
+            return json.dumps(
+                {
+                    "refused": "hashes_required",
+                    "detail": str(e),
+                    "remedy": "name the torrents by hash; list_torrents finds them. "
+                    'Only if every torrent was asked for, pass hashes=["all"] on '
+                    "its own with confirm=true",
+                },
+                indent=2,
+            )
+        except errors.UnknownTorrents as e:
+            return json.dumps(
+                {
+                    "refused": "unknown_torrents",
+                    "detail": str(e),
+                    "remedy": "nothing was changed; list_torrents shows the hashes "
+                    "this server has",
                 },
                 indent=2,
             )
@@ -205,9 +226,29 @@ def _tool(**kw: Any) -> Callable[[Callable[..., str]], Callable[..., str]]:
     """
 
     def decorate(fn: Callable[..., str]) -> Callable[..., str]:
-        return server.tool(**kw)(_safe(fn))  # type: ignore[no-any-return]
+        registered = server.tool(**kw)(_safe(fn))
+        _forbid_unknown_arguments(getattr(fn, "__name__"))  # noqa: B009
+        return registered  # type: ignore[no-any-return]
 
     return decorate
+
+
+def _forbid_unknown_arguments(name: str) -> None:
+    """Make a mistyped argument an error instead of dropping it.
+
+    The SDK ignores arguments a tool doesn't declare, so `hash=[one]` for
+    `hashes` used to reach the tool as no hashes at all, and `delete_file=True`
+    as keeping the files. It has no option for this, so the argument model is
+    tightened after registration; a unit test checks every tool, so an SDK change
+    that undoes this fails the suite rather than quietly reverting it.
+    """
+    tool = server._tool_manager.get_tool(name)
+    if tool is None:
+        raise RuntimeError(f"tool {name!r} wasn't registered under its function name")
+
+    strict = {"model_config": ConfigDict(extra="forbid")}
+    tool.fn_metadata.arg_model = type("Strict", (tool.fn_metadata.arg_model,), strict)
+    tool.parameters["additionalProperties"] = False
 
 
 def _client() -> Client:
@@ -227,10 +268,30 @@ def _brief(t: dict, fields: tuple[str, ...] = BRIEF) -> dict:
     return {k: t[k] for k in fields if k in t}
 
 
-def _hashes(value: str | list[str] | None) -> str | list[str]:
-    if value is None:
-        return "all"
-    return value
+def _find_targets(
+    c: Client, path: str, hashes: list[str] | None, *, confirm: bool = False, **params: Any
+) -> tuple[int | str, list[str]]:
+    """Refuse a bad call, then say how many of its torrents exist and which don't.
+
+    The server answers 200 for a hash it doesn't have, and a reply built from the
+    request would report that as done.
+    """
+    c.preflight(path, hashes=hashes, confirm=confirm, **params)
+    if hashes == [ALL]:
+        return ALL, []
+    # Match the rows ourselves. 4.4.5 answers a filter holding only hashes it can't
+    # parse with the whole library, which would count every torrent as found;
+    # 4.5.5 and later answer it with nothing. A v2 torrent's
+    # `hash` is its truncated id, so the full hashes have to match too.
+    fields = ("hash", "infohash_v1", "infohash_v2")
+    wanted = {h.lower() for h in hashes or []}
+    rows = c.call("torrents/info", hashes=hashes)
+    ids = [{str(t[key]).lower() for key in fields if t.get(key)} for t in rows]
+    matched = [row for row in ids if row & wanted]
+    if not matched:
+        raise errors.UnknownTorrents(f"this server has none of {hashes}")
+    known = set().union(*matched)
+    return len(matched), [h for h in hashes or [] if h.lower() not in known]
 
 
 # --------------------------------------------------------------------------- #
@@ -448,8 +509,15 @@ def control_torrents(
         str, Field(description="start, stop, recheck, reannounce, force_start, unforce_start")
     ],
     hashes: Annotated[
-        list[str] | None, Field(description="torrent hashes; omit for all")
+        list[str] | None,
+        Field(
+            description=(
+                'required: the torrent hashes. The single value "all" targets EVERY '
+                "torrent and needs confirm=true"
+            )
+        ),
     ] = None,
+    confirm: Annotated[bool, Field(description='must be true for "all"')] = False,
 ) -> str:
     paths = {
         "start": ("torrents/start", {}),
@@ -463,8 +531,11 @@ def control_torrents(
         return json.dumps({"error": f"unknown action {action!r}", "accepted": sorted(paths)})
     path, extra = paths[action]
     with _client() as c:
-        c.call(path, hashes=_hashes(hashes), **extra)
-    return json.dumps({"ok": True, "action": action, "applied_to": hashes or "all"}, indent=2)
+        applied, missing = _find_targets(c, path, hashes, confirm=confirm, **extra)
+        c.call(path, hashes=hashes, confirm=confirm, **extra)
+    return json.dumps(
+        {"ok": True, "action": action, "applied_to": applied, "not_found": missing}, indent=2
+    )
 
 
 @_tool(
@@ -488,9 +559,13 @@ def delete_torrents(
     confirm: Annotated[bool, Field(description="must be true to proceed")] = False,
 ) -> str:
     with _client() as c:
+        removed, missing = _find_targets(
+            c, "torrents/delete", hashes, confirm=confirm, deleteFiles=delete_files
+        )
         c.call("torrents/delete", hashes=hashes, deleteFiles=delete_files, confirm=confirm)
     return json.dumps(
-        {"ok": True, "removed": len(hashes), "files_deleted": delete_files}, indent=2
+        {"ok": True, "removed": removed, "not_found": missing, "files_deleted": delete_files},
+        indent=2,
     )
 
 
@@ -533,7 +608,11 @@ def categories(
         if action == "create":
             c.call("torrents/createCategory", category=name, savePath=save_path)
         elif action == "edit":
-            c.call("torrents/editCategory", category=name, savePath=save_path or "")
+            # Leaving it out used to clear the category's save path. Pass ""
+            # to clear it on purpose.
+            if save_path is None:
+                return json.dumps({"error": "save_path is required for edit"})
+            c.call("torrents/editCategory", category=name, savePath=save_path)
         elif action == "remove":
             c.call("torrents/removeCategories", categories=[name], confirm=confirm)
         else:
@@ -546,9 +625,15 @@ def tags(
     action: Annotated[str, Field(description="list, create, delete, add or remove")] = "list",
     names: Annotated[list[str] | None, Field(description="tag names")] = None,
     hashes: Annotated[
-        list[str] | None, Field(description="torrents, for add and remove")
+        list[str] | None,
+        Field(
+            description=(
+                'torrents, required for add and remove. The single value "all" '
+                "targets EVERY torrent and needs confirm=true"
+            )
+        ),
     ] = None,
-    confirm: Annotated[bool, Field(description="required for delete")] = False,
+    confirm: Annotated[bool, Field(description='required for delete and for "all"')] = False,
 ) -> str:
     with _client() as c:
         if action == "list":
@@ -559,10 +644,20 @@ def tags(
             c.call("torrents/createTags", tags=names)
         elif action == "delete":
             c.call("torrents/deleteTags", tags=names, confirm=confirm)
-        elif action == "add":
-            c.call("torrents/addTags", hashes=_hashes(hashes), tags=names)
-        elif action == "remove":
-            c.call("torrents/removeTags", hashes=_hashes(hashes), tags=names)
+        elif action in ("add", "remove"):
+            path = "torrents/addTags" if action == "add" else "torrents/removeTags"
+            applied, missing = _find_targets(c, path, hashes, confirm=confirm, tags=names)
+            c.call(path, hashes=hashes, tags=names, confirm=confirm)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "action": action,
+                    "tags": names,
+                    "applied_to": applied,
+                    "not_found": missing,
+                },
+                indent=2,
+            )
         else:
             return json.dumps({"error": f"unknown action {action!r}"})
     return json.dumps({"ok": True, "action": action, "tags": names}, indent=2)
@@ -582,6 +677,11 @@ def preferences(
     ] = None,
     keys: Annotated[list[str] | None, Field(description="limit a read to these keys")] = None,
 ) -> str:
+    # Anything but "read" used to fall through to the write below, typos included.
+    if action not in ("read", "write"):
+        return json.dumps(
+            {"error": f"unknown action {action!r}", "accepted": ["read", "write"]}
+        )
     with _client() as c:
         if action == "read":
             prefs = c.call("app/preferences")

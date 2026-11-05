@@ -109,6 +109,28 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _check_targets(path: str, name: str, value: Any, confirm: bool) -> None:
+    """Make a model say which torrents it means.
+
+    On the wire, `all` is one small word for every torrent in the library. A
+    person typing it at the CLI meant it; a model can reach it by leaving an
+    argument out.
+    """
+    items = [] if value is None else value.split("|") if isinstance(value, str) else list(value)
+    named = [s for s in (str(item).strip() for item in items) if s]
+    if not named:
+        raise errors.MissingTargets(f"{path}: {name} names no torrents")
+    if ALL not in named:
+        return
+    if len(named) > 1:
+        raise errors.MissingTargets(f'{path}: {name} mixes "all" with specific hashes')
+    if not confirm:
+        raise errors.ConfirmationRequired(
+            f"{path} would act on every torrent; name the ones you mean, or "
+            f"pass confirm=True if every torrent is what was asked for"
+        )
+
+
 def encode(param_wire: Wire, value: Any) -> str | tuple[str, bytes]:
     """Render a Python value the way qBittorrent expects to read it."""
     if param_wire is Wire.BOOL_STR:
@@ -118,7 +140,12 @@ def encode(param_wire: Wire, value: Any) -> str | tuple[str, bytes]:
             return ALL
         if isinstance(value, str):
             return value
-        return "|".join(value)
+        hashes = list(value)
+        # A list says how many torrents were meant, and joining this would
+        # silently turn one of them into two.
+        if any("|" in h for h in hashes):
+            raise errors.QbtError(f"a hash can't contain the | separator: {hashes!r}")
+        return "|".join(hashes)
     if param_wire is Wire.PIPE_LIST:
         return value if isinstance(value, str) else "|".join(str(v) for v in value)
     if param_wire is Wire.JSON_BLOB:
@@ -294,7 +321,22 @@ class Client:
             raise errors.QbtError(f"unknown endpoint {path!r}")
         return self.call_endpoint(ep, confirm=confirm, **params)
 
+    def preflight(self, path: str, /, *, confirm: bool = False, **params: Any) -> None:
+        """Run the gates for a call without making it.
+
+        For a caller that has to read something first: a refusal shouldn't
+        depend on that read succeeding.
+        """
+        ep = self._spec.get(path)
+        if ep is None:
+            raise errors.QbtError(f"unknown endpoint {path!r}")
+        self._check_gates(ep, confirm, params)
+
     def call_endpoint(self, ep: Endpoint, *, confirm: bool = False, **params: Any) -> Any:
+        self._check_gates(ep, confirm, params)
+        return self._send(ep, params)
+
+    def _check_gates(self, ep: Endpoint, confirm: bool, params: dict[str, Any]) -> None:
         """Gates, in order, all before any request so a refusal never depends on
         reaching the server.
 
@@ -302,7 +344,8 @@ class Client:
         2. agent-forbidden endpoint, then param.
         3. blocklist      — keys refused on every path, with no override.
         4. allowlist      — on the agent path only; a warning on the CLI.
-        5. confirm        — destructive endpoints.
+        5. targets        — on the agent path only; every torrent needs `confirm`.
+        6. confirm        — destructive endpoints.
 
         The no-override refusals come before `confirm` on purpose. Ordered the
         other way, a model is told "pass confirm=True", passes it, and only then
@@ -361,14 +404,20 @@ class Client:
                     warnings.warn(
                         f"{ep.path}: {', '.join(unlisted)} is outside the reviewed-safe "
                         f"set; check what it does before relying on this.",
-                        stacklevel=2,
+                        stacklevel=3,
                     )
+
+        if self.agent and ep.mutating:
+            for p in ep.params:
+                if p.wire is Wire.HASHES and (p.required or p.name in params):
+                    _check_targets(ep.path, p.name, params.get(p.name), confirm)
 
         if ep.destructive and not confirm:
             raise errors.ConfirmationRequired(
                 f"{ep.path} is destructive; pass confirm=True to proceed"
             )
 
+    def _send(self, ep: Endpoint, params: dict[str, Any]) -> Any:
         version = self.version
         # A rename is not an absence. `since` on a renamed endpoint records when
         # the *name* changed, not when the capability appeared: stopping a
