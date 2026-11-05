@@ -31,8 +31,9 @@ throwaway container, never on the host, which holds real credentials:
 - Read any change to `pyproject.toml` and `uv.lock` before running a branch. A
   dependency built from an sdist runs its build code during the dependency install,
   with the network and the shared cache.
-- Cap anything that could run away: the commands below have a memory limit,
-  `ulimit -v` and a timeout. `/tmp` on the host is tmpfs and counts against memory.
+- Cap anything that could run away: every step below that runs this repo's code has
+  a memory limit, `ulimit -v` and a timeout. `/tmp` on the host is tmpfs and counts
+  against memory.
 
 Build the image once. The official uv images can be older than the `>=0.12` that
 `pyproject.toml` requires.
@@ -75,8 +76,12 @@ SH
 sandbox; CI runs it. To check behavior against a real server locally, run this. It
 starts a throwaway server on a network with no way out, runs this project's code
 against it, and removes everything on exit. Names include the shell's PID, because
-Dev and QA share a podman account. Replace the last `qbt doctor` line with what you
-want to run; `QBT_URL`, `QBT_USERNAME` and `QBT_PASSWORD` are already set.
+Dev and QA share a podman account. Replace the `qbt doctor` line with what you want
+to run; `QBT_URL`, `QBT_USERNAME` and `QBT_PASSWORD` are already set.
+
+`SIGKILL` skips that cleanup, and a tool that kills a timed-out command can send it.
+Leftovers are named `qbtk-<pid>-*` (the checks command's is `qbtk-venv-<pid>`). Remove
+your own by that PID, and never all `qbtk-*`, because another session may be using them.
 
 ```sh
 sh -eu <<'SH'
@@ -84,17 +89,18 @@ root=$(git rev-parse --show-toplevel)
 id=qbtk-$$
 srv=$id-srv net=$id-net cfg=$id-cfg venv=$id-venv
 trap 'podman rm -f -t 0 "$srv" >/dev/null 2>&1 || true
-  podman network rm "$net" >/dev/null 2>&1 || true
-  podman volume rm -f "$cfg" "$venv" >/dev/null' EXIT
+  podman volume rm -f "$cfg" "$venv" >/dev/null
+  podman network rm "$net" >/dev/null 2>&1 || true' EXIT
 box() {
   podman run --rm --security-opt label=disable --memory=4g \
     -v "$root":/work:ro -v "$venv":/venv -w /work \
     -e UV_PROJECT_ENVIRONMENT=/venv -e UV_FROZEN=1 -e PYTHONDONTWRITEBYTECODE=1 "$@"
 }
 podman network create --internal "$net" >/dev/null
-podman run --rm --security-opt label=disable --network none \
+podman run --rm --security-opt label=disable --network none --memory=4g \
   -v "$root":/work:ro -v "$cfg":/cfg -w /work \
-  qbtk-dev sh -ec 'mkdir -p /cfg/qBittorrent/config
+  qbtk-dev timeout 60 sh -ec 'ulimit -v 6000000
+    mkdir -p /cfg/qBittorrent/config
     python -I tests/contract/seed_config.py --password testpass123 \
       --out /cfg/qBittorrent/config/qBittorrent.conf'
 podman run -d --name "$srv" --network "$net" -e QBT_LEGAL_NOTICE=confirm \
@@ -115,7 +121,8 @@ for _ in range(60):
     except OSError:
         time.sleep(1)
 "
-  uv run --no-sync qbt doctor'
+  uv run --no-sync qbt doctor
+'
 SH
 ```
 
@@ -148,24 +155,57 @@ This file and the label workflows (`qa-gate.yml`, `pr-labels.yml`,
 
 - **Code PRs:** branch from this fork's `main`, and keep them small and suited to
   upstream, with a `CHANGELOG.md` entry. A change meant to stay on this fork is a
-  code PR that never gets offered.
+  code PR that never gets offered, and it gets an entry too.
 - **Fork-only PRs:** these change only the files above, and get no `CHANGELOG.md`
-  entry, because it would conflict with each upstream sync.
+  entry, because nothing changes for someone using the package.
 - **Offering a change upstream:** only when the maintainer asks, build a separate
   branch from upstream with that change's own commits. Conflicts surface here, for
   a person to resolve. The branch has no copy of this file, so don't start new work
-  on it. Run the checks above on it, then run the `git diff` below, which must exit 0.
-  It exits 1 if fork-only files came along, and with another code if a ref is bad.
+  on it. If the cherry-pick stops on a conflict, resolve it and run
+  `git cherry-pick --continue`.
 
   ```sh
+  sh -eu <<'SH'
   git fetch https://github.com/manueltarouca/qbt-kit.git main
   base=$(git rev-parse FETCH_HEAD)
+  echo "base=$base"
   git switch -c offer/<name> "$base"
   git cherry-pick <commits>
-  git diff --exit-code --name-only "$base"...HEAD -- CLAUDE.md .github/workflows/qa-gate.yml .github/workflows/pr-labels.yml .github/workflows/pr-labels-ci.yml
+  SH
   ```
 
-  Fetching by URL avoids adding an `upstream` remote, which `gh` can resolve to.
+  Run the checks above on that branch, then this, with the `base` it printed. It must
+  exit 0. It exits 1 if fork-only files came along, and with another code if a ref is
+  bad.
+
+  ```sh
+  git diff --exit-code --name-only <base>...HEAD -- CLAUDE.md .github/workflows/qa-gate.yml .github/workflows/pr-labels.yml .github/workflows/pr-labels-ci.yml
+  ```
+
+Fetching by URL avoids adding an `upstream` remote, which `gh` can resolve to.
+
+## Syncing from upstream
+
+This fork's `main` differs from upstream, and required checks block pushing to it, so
+a sync is a PR. Upstream's code is outside code: read the incoming diff before
+running it, especially workflows, `pyproject.toml`, `uv.lock` and test bootstrap files.
+
+```sh
+sh -eu <<'SH'
+git fetch origin main
+git fetch https://github.com/manueltarouca/qbt-kit.git main
+git switch -c sync/<upstream version> origin/main
+git merge FETCH_HEAD
+SH
+```
+
+The upstream fetch has to come last, because each fetch writes over `FETCH_HEAD`.
+
+`CHANGELOG.md` conflicts are expected, because code PRs add entries here and upstream
+adds release sections. Resolve them by hand: keep upstream's sections, and keep this
+fork's entries under `[Unreleased]` except any that upstream has now released. Merge
+the PR with a merge commit. A squash drops upstream's history, so the next sync hits
+the same conflicts again.
 
 ## Changes that affect what a model can do
 
