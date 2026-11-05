@@ -72,15 +72,16 @@ box --network none qbtk-dev timeout 600 sh -ec '
   uv run --no-sync ruff check --no-cache src tools tests
   uv run --no-sync ruff format --no-cache --check src tools tests
   uv run --no-sync ty check src tools tests || true
-  uv run --no-sync python tools/build_coverage.py --target release-5.2.3 --strict'
+  uv run --no-sync python tools/build_coverage.py --target release-5.2.3 --strict
+'
 SH
 ```
 
 The mount is read-only, so nothing here writes to the tree. To apply formatting,
 replace the offline step's `uv` lines after the sync with
-`uv run --no-sync ruff format --no-cache --diff src tools tests || true`, send the
-command's output to a file outside the repo, read it, and apply it with
-`git apply -p0`. Updating `uv.lock` and running `tools/extract_inventory.py` need the
+`uv run --no-sync ruff format --no-cache --diff src tools tests || [ $? -eq 1 ]`, send
+the command's output to a file outside the repo, read it, and apply it with
+`git apply -p0`. Exit 1 only means there are changes to apply. Updating `uv.lock` and running `tools/extract_inventory.py` need the
 network alongside repo code, so ask the maintainer first.
 
 `tests/contract` shells out to a container runtime, so it can't run in that
@@ -99,7 +100,11 @@ id=qbtk-$$
 srv=$id-srv net=$id-net cfg=$id-cfg venv=$id-venv
 echo "id=$id"
 podman volume create "$venv" >/dev/null
-trap 'rc=$?; [ "$rc" -eq 0 ] || podman logs --tail 20 "$srv" >&2 || true
+trap 'rc=$?
+  if [ "$rc" -ne 0 ] && podman container exists "$srv"; then
+    echo "--- end of server log ($srv):" >&2
+    podman logs --tail 20 "$srv" >&2 || true
+  fi
   podman rm -f -t 0 "$srv" >/dev/null 2>&1 || true
   podman volume rm -f "$cfg" "$venv" >/dev/null
   podman network rm "$net" >/dev/null 2>&1 || true' EXIT
@@ -126,10 +131,12 @@ box --network "$net" -e QBT_URL="http://$srv:8080" \
   ulimit -v 6000000
   uv sync --all-extras -q --offline
   python -Ic "
-import os, time, urllib.request
+import os, time, urllib.error, urllib.request
 for _ in range(60):
     try:
         urllib.request.urlopen(os.environ[\"QBT_URL\"], timeout=3)
+        break
+    except urllib.error.HTTPError:
         break
     except OSError:
         time.sleep(1)
@@ -220,17 +227,20 @@ This fork's `main` differs from upstream, so a sync is a PR.
 sh -eu <<'SH'
 git fetch origin main
 git fetch https://github.com/manueltarouca/qbt-kit.git main
+up=$(git rev-parse FETCH_HEAD)
+echo "upstream=$up"
 git switch -c sync/<upstream version> origin/main
-git merge FETCH_HEAD
+git merge "$up"
 SH
 ```
 
 The upstream fetch has to come last, because each fetch writes over `FETCH_HEAD`.
 
 1. **Read the incoming diff before pushing the branch,** with
-   `git diff origin/main...FETCH_HEAD`. Upstream's code is outside code, and opening
-   the PR runs its workflows with this repo's token. Look hardest at workflows,
-   `pyproject.toml`, `uv.lock` and test bootstrap files.
+   `git diff origin/main...<upstream>`, using the value it printed. Upstream's code is
+   outside code, and opening the PR runs its workflows with this repo's token. Look
+   hardest at workflows, `pyproject.toml`, `uv.lock` and test bootstrap files. An empty
+   diff is only right if the merge said `Already up to date`.
 2. **Resolve `CHANGELOG.md` by hand.** Conflicts are expected, because code PRs add
    entries here and upstream adds release sections. Keep upstream's sections, and keep
    this fork's entries under `## [Unreleased]` except any that upstream has now
