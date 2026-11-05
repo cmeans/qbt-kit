@@ -28,9 +28,10 @@ throwaway container, never on the host, which holds real credentials:
   the project, so a branch's `[build-system]` backend only runs in the offline step.
 - Use a new virtualenv volume for each run, so code from one branch can't change
   what a later run executes. Only the dependency install mounts uv's shared cache.
-- Read any change to `pyproject.toml` and `uv.lock` before running a branch. A
-  dependency built from an sdist runs its build code during the dependency install,
-  with the network and the shared cache.
+- Read any change to `pyproject.toml`, `uv.lock`, `uv.toml` and `.python-version`
+  before running a branch, because the dependency install acts on them with the
+  network. It uses `--no-build`, so a dependency with no wheel fails there rather
+  than running its build code.
 - Cap anything that could run away: every step below that runs this repo's code has
   a memory limit, `ulimit -v` and a timeout. `/tmp` on the host is tmpfs and counts
   against memory.
@@ -47,12 +48,15 @@ EOF
 
 Then run the checks. The exit code is meaningful: any failure except `ty`, which is
 advisory as it is in CI, makes it nonzero. Outside a git repo it stops rather than
-mounting the wrong directory.
+mounting the wrong directory. If the volume name already exists because a PID was
+reused, it stops rather than using an old virtualenv.
 
 ```sh
 sh -eu <<'SH'
 root=$(git rev-parse --show-toplevel)
 venv=qbtk-venv-$$
+echo "venv=$venv"
+podman volume create "$venv" >/dev/null
 trap 'podman volume rm -f "$venv" >/dev/null' EXIT
 box() {
   podman run --rm --security-opt label=disable --memory=4g \
@@ -60,7 +64,7 @@ box() {
     -e UV_PROJECT_ENVIRONMENT=/venv -e UV_FROZEN=1 -e PYTHONDONTWRITEBYTECODE=1 "$@"
 }
 box -v qbtk-uvcache:/uvcache -e UV_CACHE_DIR=/uvcache qbtk-dev \
-  timeout 600 uv sync --all-extras -q --no-install-project
+  timeout 600 uv sync --all-extras -q --no-install-project --no-build
 box --network none qbtk-dev timeout 600 sh -ec '
   ulimit -v 6000000
   uv sync --all-extras -q --offline
@@ -72,23 +76,31 @@ box --network none qbtk-dev timeout 600 sh -ec '
 SH
 ```
 
+The mount is read-only, so nothing here writes to the tree. To apply formatting,
+replace the offline step's `uv` lines after the sync with
+`uv run --no-sync ruff format --no-cache --diff src tools tests || true`, send the
+command's output to a file outside the repo, read it, and apply it with
+`git apply -p0`. Updating `uv.lock` and running `tools/extract_inventory.py` need the
+network alongside repo code, so ask the maintainer first.
+
 `tests/contract` shells out to a container runtime, so it can't run in that
 sandbox; CI runs it. To check behavior against a real server locally, run this. It
 starts a throwaway server on a network with no way out, runs this project's code
 against it, and removes everything on exit. Names include the shell's PID, because
 Dev and QA share a podman account. Replace the `qbt doctor` line with what you want
-to run; `QBT_URL`, `QBT_USERNAME` and `QBT_PASSWORD` are already set.
-
-`SIGKILL` skips that cleanup, and a tool that kills a timed-out command can send it.
-Leftovers are named `qbtk-<pid>-*` (the checks command's is `qbtk-venv-<pid>`). Remove
-your own by that PID, and never all `qbtk-*`, because another session may be using them.
+to run, using only double quotes on it, because it's inside a single-quoted string.
+`QBT_URL`, `QBT_USERNAME` and `QBT_PASSWORD` are already set. On failure it prints the
+end of the server's log before removing it.
 
 ```sh
 sh -eu <<'SH'
 root=$(git rev-parse --show-toplevel)
 id=qbtk-$$
 srv=$id-srv net=$id-net cfg=$id-cfg venv=$id-venv
-trap 'podman rm -f -t 0 "$srv" >/dev/null 2>&1 || true
+echo "id=$id"
+podman volume create "$venv" >/dev/null
+trap 'rc=$?; [ "$rc" -eq 0 ] || podman logs --tail 20 "$srv" >&2 || true
+  podman rm -f -t 0 "$srv" >/dev/null 2>&1 || true
   podman volume rm -f "$cfg" "$venv" >/dev/null
   podman network rm "$net" >/dev/null 2>&1 || true' EXIT
 box() {
@@ -97,6 +109,7 @@ box() {
     -e UV_PROJECT_ENVIRONMENT=/venv -e UV_FROZEN=1 -e PYTHONDONTWRITEBYTECODE=1 "$@"
 }
 podman network create --internal "$net" >/dev/null
+podman volume create "$cfg" >/dev/null
 podman run --rm --security-opt label=disable --network none --memory=4g \
   -v "$root":/work:ro -v "$cfg":/cfg -w /work \
   qbtk-dev timeout 60 sh -ec 'ulimit -v 6000000
@@ -107,7 +120,7 @@ podman run -d --name "$srv" --network "$net" -e QBT_LEGAL_NOTICE=confirm \
   -e QBT_WEBUI_PORT=8080 -v "$cfg":/config \
   docker.io/qbittorrentofficial/qbittorrent-nox:5.2.3-1 >/dev/null
 box -v qbtk-uvcache:/uvcache -e UV_CACHE_DIR=/uvcache qbtk-dev \
-  timeout 600 uv sync --all-extras -q --no-install-project
+  timeout 600 uv sync --all-extras -q --no-install-project --no-build
 box --network "$net" -e QBT_URL="http://$srv:8080" \
   -e QBT_USERNAME=testuser -e QBT_PASSWORD=testpass123 qbtk-dev timeout 600 sh -ec '
   ulimit -v 6000000
@@ -120,10 +133,21 @@ for _ in range(60):
         break
     except OSError:
         time.sleep(1)
+else:
+    raise SystemExit(\"server did not answer\")
 "
   uv run --no-sync qbt doctor
 '
 SH
+```
+
+`SIGKILL` skips the cleanup, and a tool that kills a timed-out command can send it.
+Remove your own leftovers using the `id` it printed, in this order, and never all
+`qbtk-*`, because another session may be using them. For the checks command, it's
+`podman volume rm -f <venv>`.
+
+```sh
+podman rm -f -t 0 <id>-srv; podman volume rm -f <id>-cfg <id>-venv; podman network rm <id>-net
 ```
 
 ## Testing against a server
@@ -154,41 +178,43 @@ This file and the label workflows (`qa-gate.yml`, `pr-labels.yml`,
 `pr-labels-ci.yml`) are specific to this fork, and this fork's `main` carries them.
 
 - **Code PRs:** branch from this fork's `main`, and keep them small and suited to
-  upstream, with a `CHANGELOG.md` entry. A change meant to stay on this fork is a
-  code PR that never gets offered, and it gets an entry too.
+  upstream, with a `CHANGELOG.md` entry under `## [Unreleased]`, adding that heading
+  if it's missing. A change meant to stay on this fork is a code PR that never gets
+  offered, and it gets an entry too.
 - **Fork-only PRs:** these change only the files above, and get no `CHANGELOG.md`
   entry, because nothing changes for someone using the package.
-- **Offering a change upstream:** only when the maintainer asks, build a separate
-  branch from upstream with that change's own commits. Conflicts surface here, for
-  a person to resolve. The branch has no copy of this file, so don't start new work
-  on it. If the cherry-pick stops on a conflict, resolve it and run
-  `git cherry-pick --continue`.
 
-  ```sh
-  sh -eu <<'SH'
-  git fetch https://github.com/manueltarouca/qbt-kit.git main
-  base=$(git rev-parse FETCH_HEAD)
-  echo "base=$base"
-  git switch -c offer/<name> "$base"
-  git cherry-pick <commits>
-  SH
-  ```
+### Offering a change upstream
 
-  Run the checks above on that branch, then this, with the `base` it printed. It must
-  exit 0. It exits 1 if fork-only files came along, and with another code if a ref is
-  bad.
+Only when the maintainer asks, build a separate branch from upstream with that
+change's own commits. Conflicts surface here, for a person to resolve. The branch has
+no copy of this file, so don't start new work on it. If the cherry-pick stops on a
+conflict, resolve it and run `git cherry-pick --continue`.
 
-  ```sh
-  git diff --exit-code --name-only <base>...HEAD -- CLAUDE.md .github/workflows/qa-gate.yml .github/workflows/pr-labels.yml .github/workflows/pr-labels-ci.yml
-  ```
+```sh
+sh -eu <<'SH'
+git fetch https://github.com/manueltarouca/qbt-kit.git main
+base=$(git rev-parse FETCH_HEAD)
+echo "base=$base"
+git switch -c offer/<name> "$base"
+git cherry-pick <commits>
+SH
+```
+
+Run the checks above on that branch, then this, with the `base` it printed. It must
+exit 0. It exits 1 if fork-only files came along, and with another code if a ref is
+bad. It only knows these names, so also read `git diff --stat <base>...HEAD`, which
+must list only the offered change.
+
+```sh
+git diff --exit-code --name-only <base>...HEAD -- CLAUDE.md .github/workflows/qa-gate.yml .github/workflows/pr-labels.yml .github/workflows/pr-labels-ci.yml
+```
 
 Fetching by URL avoids adding an `upstream` remote, which `gh` can resolve to.
 
 ## Syncing from upstream
 
-This fork's `main` differs from upstream, and required checks block pushing to it, so
-a sync is a PR. Upstream's code is outside code: read the incoming diff before
-running it, especially workflows, `pyproject.toml`, `uv.lock` and test bootstrap files.
+This fork's `main` differs from upstream, so a sync is a PR.
 
 ```sh
 sh -eu <<'SH'
@@ -201,11 +227,19 @@ SH
 
 The upstream fetch has to come last, because each fetch writes over `FETCH_HEAD`.
 
-`CHANGELOG.md` conflicts are expected, because code PRs add entries here and upstream
-adds release sections. Resolve them by hand: keep upstream's sections, and keep this
-fork's entries under `[Unreleased]` except any that upstream has now released. Merge
-the PR with a merge commit. A squash drops upstream's history, so the next sync hits
-the same conflicts again.
+1. **Read the incoming diff before pushing the branch,** with
+   `git diff origin/main...FETCH_HEAD`. Upstream's code is outside code, and opening
+   the PR runs its workflows with this repo's token. Look hardest at workflows,
+   `pyproject.toml`, `uv.lock` and test bootstrap files.
+2. **Resolve `CHANGELOG.md` by hand.** Conflicts are expected, because code PRs add
+   entries here and upstream adds release sections. Keep upstream's sections, and keep
+   this fork's entries under `## [Unreleased]` except any that upstream has now
+   released. Then run `git commit --no-edit`.
+3. **Update what depends on CI.** If `ci.yaml`'s version matrix or coverage target
+   changed, update the server image, the `--target` and the version list in this file,
+   and ask the maintainer to update the required checks.
+4. **Merge the PR with a merge commit.** A squash drops upstream's history, so the next
+   sync hits the same conflicts again.
 
 ## Changes that affect what a model can do
 
