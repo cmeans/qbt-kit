@@ -13,6 +13,9 @@ This file takes precedence over those documents where they differ:
   the maintainer. See "Security reports and upstream".
 - `.mcp.json` starts `uv run` on the host if an MCP client loads it. Decline it in
   this checkout.
+- `README.md` and `skills/qbt-kit/SKILL.md` give `uvx` commands, which install the
+  published package on the host. They're for people using a release. Don't use them
+  to run or test anything here.
 
 ## Running the code
 
@@ -21,11 +24,14 @@ throwaway container, never on the host, which holds real credentials:
 
 - Mount the repo read-only.
 - Never mount `$HOME`, the keyring, credential directories or the container socket.
-- Give the code no network. Only the dependency install gets one, and that step
-  doesn't run tests.
+- Give the code no network. Only the dependency install gets one. That step skips
+  the project, so a branch's `[build-system]` backend only runs in the offline step.
 - Use a new virtualenv volume for each run, so code from one branch can't change
-  what a later run executes. Only the install step mounts uv's shared cache.
-- Cap anything that could run away: the command below has a memory limit,
+  what a later run executes. Only the dependency install mounts uv's shared cache.
+- Read any change to `pyproject.toml` and `uv.lock` before running a branch. A
+  dependency built from an sdist runs its build code during the dependency install,
+  with the network and the shared cache.
+- Cap anything that could run away: the commands below have a memory limit,
   `ulimit -v` and a timeout. `/tmp` on the host is tmpfs and counts against memory.
 
 Build the image once. The official uv images can be older than the `>=0.12` that
@@ -52,10 +58,12 @@ box() {
     -v "$root":/work:ro -v "$venv":/venv -w /work \
     -e UV_PROJECT_ENVIRONMENT=/venv -e UV_FROZEN=1 -e PYTHONDONTWRITEBYTECODE=1 "$@"
 }
-box -v qbtk-uvcache:/uvcache -e UV_CACHE_DIR=/uvcache qbtk-dev uv sync --all-extras -q
-box --network none qbtk-dev sh -ec '
+box -v qbtk-uvcache:/uvcache -e UV_CACHE_DIR=/uvcache qbtk-dev \
+  timeout 600 uv sync --all-extras -q --no-install-project
+box --network none qbtk-dev timeout 600 sh -ec '
   ulimit -v 6000000
-  timeout 300 uv run --no-sync pytest -q -p no:cacheprovider tests/unit
+  uv sync --all-extras -q --offline
+  uv run --no-sync pytest -q -p no:cacheprovider tests/unit
   uv run --no-sync ruff check --no-cache src tools tests
   uv run --no-sync ruff format --no-cache --check src tools tests
   uv run --no-sync ty check src tools tests || true
@@ -64,23 +72,51 @@ SH
 ```
 
 `tests/contract` shells out to a container runtime, so it can't run in that
-sandbox; CI runs it. To check behavior against a real server locally, start one on
-a network with no way out. The login is `testuser` / `testpass123`, at
-`http://qbtk-srv:8080` from a sandbox started with `--network qbtk-net`:
+sandbox; CI runs it. To check behavior against a real server locally, run this. It
+starts a throwaway server on a network with no way out, runs this project's code
+against it, and removes everything on exit. Names include the shell's PID, because
+Dev and QA share a podman account. Replace the last `qbt doctor` line with what you
+want to run; `QBT_URL`, `QBT_USERNAME` and `QBT_PASSWORD` are already set.
 
 ```sh
-podman network create --internal qbtk-net
-podman volume create qbtk-config
+sh -eu <<'SH'
+root=$(git rev-parse --show-toplevel)
+id=qbtk-$$
+srv=$id-srv net=$id-net cfg=$id-cfg venv=$id-venv
+trap 'podman rm -f -t 0 "$srv" >/dev/null 2>&1 || true
+  podman network rm "$net" >/dev/null 2>&1 || true
+  podman volume rm -f "$cfg" "$venv" >/dev/null' EXIT
+box() {
+  podman run --rm --security-opt label=disable --memory=4g \
+    -v "$root":/work:ro -v "$venv":/venv -w /work \
+    -e UV_PROJECT_ENVIRONMENT=/venv -e UV_FROZEN=1 -e PYTHONDONTWRITEBYTECODE=1 "$@"
+}
+podman network create --internal "$net" >/dev/null
 podman run --rm --security-opt label=disable --network none \
-  -v "$(git rev-parse --show-toplevel)":/work:ro -v qbtk-config:/cfg -w /work \
+  -v "$root":/work:ro -v "$cfg":/cfg -w /work \
   qbtk-dev sh -ec 'mkdir -p /cfg/qBittorrent/config
     python -I tests/contract/seed_config.py --password testpass123 \
       --out /cfg/qBittorrent/config/qBittorrent.conf'
-podman run -d --name qbtk-srv --network qbtk-net -e QBT_LEGAL_NOTICE=confirm \
-  -e QBT_WEBUI_PORT=8080 -v qbtk-config:/config \
-  docker.io/qbittorrentofficial/qbittorrent-nox:5.2.3-1
-# When finished:
-podman rm -f qbtk-srv; podman network rm qbtk-net; podman volume rm qbtk-config
+podman run -d --name "$srv" --network "$net" -e QBT_LEGAL_NOTICE=confirm \
+  -e QBT_WEBUI_PORT=8080 -v "$cfg":/config \
+  docker.io/qbittorrentofficial/qbittorrent-nox:5.2.3-1 >/dev/null
+box -v qbtk-uvcache:/uvcache -e UV_CACHE_DIR=/uvcache qbtk-dev \
+  timeout 600 uv sync --all-extras -q --no-install-project
+box --network "$net" -e QBT_URL="http://$srv:8080" \
+  -e QBT_USERNAME=testuser -e QBT_PASSWORD=testpass123 qbtk-dev timeout 600 sh -ec '
+  ulimit -v 6000000
+  uv sync --all-extras -q --offline
+  python -Ic "
+import os, time, urllib.request
+for _ in range(60):
+    try:
+        urllib.request.urlopen(os.environ[\"QBT_URL\"], timeout=3)
+        break
+    except OSError:
+        time.sleep(1)
+"
+  uv run --no-sync qbt doctor'
+SH
 ```
 
 ## Testing against a server
@@ -110,18 +146,26 @@ podman rm -f qbtk-srv; podman network rm qbtk-net; podman volume rm qbtk-config
 This file and the label workflows (`qa-gate.yml`, `pr-labels.yml`,
 `pr-labels-ci.yml`) are specific to this fork, and this fork's `main` carries them.
 
-- **Code PRs:** keep them small and suited to upstream, with a `CHANGELOG.md` entry.
-  Cut the branch from the latest upstream commit, not from this fork's `main`, and
-  never merge this fork's `main` into it, including with GitHub's "Update branch".
-  The PR still targets this fork's `main`.
+- **Code PRs:** branch from this fork's `main`, and keep them small and suited to
+  upstream, with a `CHANGELOG.md` entry. A change meant to stay on this fork is a
+  code PR that never gets offered.
 - **Fork-only PRs:** these change only the files above, and get no `CHANGELOG.md`
   entry, because it would conflict with each upstream sync.
-- Before a branch is offered upstream, check that this prints nothing, where
-  `<upstream commit>` is the commit it was cut from:
+- **Offering a change upstream:** only when the maintainer asks, build a separate
+  branch from upstream with that change's own commits. Conflicts surface here, for
+  a person to resolve. The branch has no copy of this file, so don't start new work
+  on it. Run the checks above on it, then run the `git diff` below, which must exit 0.
+  It exits 1 if fork-only files came along, and with another code if a ref is bad.
 
   ```sh
-  git diff --name-only <upstream commit>...HEAD -- CLAUDE.md .github/workflows/qa-gate.yml .github/workflows/pr-labels.yml .github/workflows/pr-labels-ci.yml
+  git fetch https://github.com/manueltarouca/qbt-kit.git main
+  base=$(git rev-parse FETCH_HEAD)
+  git switch -c offer/<name> "$base"
+  git cherry-pick <commits>
+  git diff --exit-code --name-only "$base"...HEAD -- CLAUDE.md .github/workflows/qa-gate.yml .github/workflows/pr-labels.yml .github/workflows/pr-labels-ci.yml
   ```
+
+  Fetching by URL avoids adding an `upstream` remote, which `gh` can resolve to.
 
 ## Changes that affect what a model can do
 
