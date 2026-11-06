@@ -90,8 +90,9 @@ moves the data**, which is useful deliberately and surprising accidentally.
   If something will not stop, check `force_start` first.
 - **`delete` with `--delete-files` is permanent** — not the Trash. The CLI
   requires `--confirm`, and MCP requires `confirm=true`.
-- **MCP tools have to name their torrents.** Omitted or empty hashes are refused
-  with `hashes_required`. Every torrent takes `hashes=["all"]` and `confirm=true`,
+- **MCP tools have to name their torrents.** Empty hashes are refused with
+  `hashes_required`, as are omitted ones where `hashes` is optional. Every torrent
+  takes `hashes=["all"]` and `confirm=true`,
   so name the hashes unless every torrent was asked for. A hash the server doesn't
   have comes back in `not_found`, or as `unknown_torrents` if none exist, and a
   mistyped argument is an error.

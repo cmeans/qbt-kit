@@ -136,8 +136,9 @@ class ConfirmationRequired(QbtError):
 class EveryTorrentNeedsConfirm(ConfirmationRequired):
     """A call names every torrent, and hasn't confirmed that.
 
-    Its own type because the answer differs from a destructive call's: most of
-    these can be undone, and the better next step is to name the torrents.
+    Its own type because the answer differs from a destructive call's, which keeps
+    its stronger wording: these can mostly be undone, and the better next step is to
+    name the torrents.
     """
 
 
@@ -152,8 +153,9 @@ class MissingTargets(QbtError):
 class MissingTags(QbtError):
     """A tag call leaves out which tags, or names a blank one.
 
-    qBittorrent reads that as every tag: measured on 4.4.5 through 5.2.3, removing
-    "" took all of a torrent's tags off and reported success.
+    On removal qBittorrent reads that as every tag: measured on 4.4.5 through 5.2.3,
+    removing "" or "," took all of a torrent's tags off and reported success. Adding
+    one does nothing, and is refused too because it can't be what was meant.
     """
 
 

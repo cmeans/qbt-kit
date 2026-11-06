@@ -118,8 +118,8 @@ def _safe(fn: Callable[..., str]) -> Callable[..., str]:
                 {
                     "refused": "tags_required",
                     "detail": str(e),
-                    "remedy": "name the tags; a blank or missing name means every tag "
-                    "on the torrent",
+                    "remedy": "name the tags; on removal, a blank or missing name "
+                    "means every tag on the torrent",
                 },
                 indent=2,
             )
@@ -314,7 +314,7 @@ def _find_targets(
     # GET, so past a certain length the filter wouldn't fit in the URL.
     fields = ("hash", "infohash_v1", "infohash_v2")
     wanted = {h.lower() for h in hashes or []}
-    if len(wanted) <= _MAX_FILTER:
+    if len(hashes or []) <= _MAX_FILTER:
         rows = c.call("torrents/info", hashes=hashes)
     else:
         rows = c.call("torrents/info")

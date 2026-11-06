@@ -14,9 +14,11 @@ Notable changes to qbt-kit. Format follows
   `hashes=["all"]` and `confirm=true`, also for `move_torrents`, which gains
   `confirm`, and for hash lists through `qbt_call`. The refusal is
   `every_torrent_needs_confirm`. The CLI still accepts `all`.
-- `tags` add/remove refuses a blank name, and `qbt_call` refuses leaving `tags`
-  out of those calls, with `tags_required`. qBittorrent reads either as every tag
-  on the torrent.
+- `tags` add/remove refuses a blank name, including `","`, and `qbt_call` refuses
+  leaving `tags` out of those calls, with `tags_required`. On removal, qBittorrent
+  reads any of these as every tag on the torrent.
+- `mcp` is capped at `<3`, because strict tool arguments rely on private SDK
+  attributes.
 - **Unknown MCP tool arguments are errors.** A mistyped `hash` used to be dropped,
   which turned a call for one torrent into a call for all of them, and
   `delete_file=true` kept the files. Tool schemas now set
@@ -36,11 +38,6 @@ Notable changes to qbt-kit. Format follows
   changing nothing.
 - A list element containing `|` is refused, rather than becoming two hashes.
 - A URL too long to build is a transport error, not a bare tool error.
-
-### Dependencies
-
-- `mcp` is capped at `<3`, because strict tool arguments rely on private SDK
-  attributes.
 
 ## [0.1.3] — 2026-11-04
 

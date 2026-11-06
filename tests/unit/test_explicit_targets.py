@@ -445,11 +445,27 @@ def test_a_short_list_is_still_filtered_by_the_server(monkeypatch: pytest.Monkey
     assert fake.sent("torrents/info")[0]["hashes"] == many
 
 
-def test_a_url_too_long_to_build_is_a_transport_error() -> None:
+def test_the_limit_counts_what_goes_in_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeats don't shrink the URL, so they have to count."""
+    fake = _Server(HASH)
+    monkeypatch.setattr(S, "_client", lambda: fake)
+    out = call("control_torrents", {"action": "stop", "hashes": [HASH] * 2000})
+    assert out["applied_to"] == 1
+    assert "hashes" not in fake.sent("torrents/info")[0]
+
+
+@pytest.mark.parametrize("method", ["_get", "_post"])
+def test_a_url_too_long_to_build_is_a_transport_error(method: str) -> None:
     """Not an httpx exception, so nothing above the client would catch it."""
     url = "http://127.0.0.1:1/api/v2/torrents/info?hashes=" + "a" * 100_000
     with pytest.raises(errors.TransportError):
-        _agent()._get(url)
+        getattr(_agent(), method)(url)
+
+
+def test_no_hashes_never_encodes_as_every_torrent() -> None:
+    """`_send` skips None today, and this was the dangerous default if it ever didn't."""
+    with pytest.raises(TypeError):
+        encode(Wire.HASHES, None)
 
 
 # ----------------------------------------------------------------- moving
@@ -559,7 +575,11 @@ def test_tagging_sends_exactly_what_was_asked(
 
 
 @pytest.mark.parametrize("action", ["add", "remove"])
-@pytest.mark.parametrize("names", [[""], ["  "], ["x", ""]], ids=["empty", "blank", "mixed"])
+@pytest.mark.parametrize(
+    "names",
+    [[""], ["  "], ["x", ""], [","], [",,"], ["x,"], [",x"], ["x, "]],
+    ids=["empty", "blank", "mixed", "comma", "commas", "comma after", "comma before", "gap"],
+)
 def test_a_blank_tag_name_is_refused(
     monkeypatch: pytest.MonkeyPatch, action: str, names: list[str]
 ) -> None:
@@ -574,8 +594,26 @@ def test_a_blank_tag_name_is_refused(
 @pytest.mark.parametrize("path", ["torrents/addTags", "torrents/removeTags"])
 @pytest.mark.parametrize(
     "params",
-    [{}, {"tags": ""}, {"tags": []}, {"tags": ["x", " "]}, {"tags": "x| "}],
-    ids=["omitted", "empty", "empty list", "blank in list", "blank in string"],
+    [
+        {},
+        {"tags": ""},
+        {"tags": []},
+        {"tags": ["x", " "]},
+        {"tags": "x| "},
+        {"tags": ","},
+        {"tags": [","]},
+        {"tags": [",,"]},
+    ],
+    ids=[
+        "omitted",
+        "empty",
+        "empty list",
+        "blank in list",
+        "blank in string",
+        "comma",
+        "comma in list",
+        "commas in list",
+    ],
 )
 def test_qbt_call_can_not_name_every_tag_by_omission(path: str, params: dict) -> None:
     out = call("qbt_call", {"path": path, "params": {"hashes": [HASH], **params}})
@@ -600,6 +638,20 @@ def test_the_every_torrent_refusal_points_at_naming_them() -> None:
 
 def test_a_destructive_refusal_keeps_its_own_wording() -> None:
     out = call("delete_torrents", {"hashes": [HASH]})
+    assert out["refused"] == "confirmation_required"
+
+
+@pytest.mark.parametrize("delete_files", [False, True], ids=["keep files", "delete files"])
+def test_deleting_every_torrent_gets_the_stronger_refusal(delete_files: bool) -> None:
+    """The worst call in the API shouldn't get the wording for one that can be undone."""
+    args = {"hashes": ["all"], "delete_files": delete_files}
+    out = call("delete_torrents", args)
+    assert out["refused"] == "confirmation_required"
+    assert "cannot be undone" in out["remedy"]
+
+
+def test_qbt_call_deleting_every_torrent_gets_the_stronger_refusal() -> None:
+    out = call("qbt_call", {"path": "torrents/delete", "params": {"hashes": "all"}})
     assert out["refused"] == "confirmation_required"
 
 

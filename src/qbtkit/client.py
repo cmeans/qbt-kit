@@ -137,7 +137,10 @@ def _check_targets(path: str, name: str, value: Any, confirm: bool) -> None:
 def _check_tags(path: str, value: Any) -> None:
     """Make a model say which tags it means, for the same reason as `_check_targets`."""
     items = [] if value is None else value.split("|") if isinstance(value, str) else list(value)
-    if not items or any(not str(item).strip() for item in items):
+    # qBittorrent splits on commas and drops the empty parts, so "," reaches it as no
+    # tags at all.
+    parts = [part for item in items for part in str(item).split(",")]
+    if not parts or any(not part.strip() for part in parts):
         raise errors.MissingTags(f"{path}: tags can't be left out or blank; got {value!r}")
 
 
@@ -420,7 +423,9 @@ class Client:
         if self.agent and ep.mutating:
             for p in ep.params:
                 if p.wire is Wire.HASHES and (p.required or p.name in params):
-                    _check_targets(ep.path, p.name, params.get(p.name), confirm)
+                    # A destructive call gets the destructive gate's stronger answer.
+                    answered = confirm or ep.destructive
+                    _check_targets(ep.path, p.name, params.get(p.name), answered)
             if ep.path in _NAMES_TAGS:
                 _check_tags(ep.path, params.get("tags"))
 
