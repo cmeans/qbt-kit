@@ -183,6 +183,9 @@ An agent driving a torrent client can destroy data that took weeks to collect,
 so the gates are code rather than guidance:
 
 - Destructive endpoints require `confirm`; `delete_files` is never implied.
+- `control_torrents`, `tags`, `move_torrents` and `delete_torrents` act only on
+  the torrents they name, and `all` needs `confirm`. A mistyped tool argument is
+  an error.
 - `--read-only` (or `QBT_READ_ONLY=1`) blocks mutations, **including via
   `qbt_call`**.
 - `app/setPreferences` refuses the WebUI, auth and network keys that would
